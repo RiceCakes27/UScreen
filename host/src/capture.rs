@@ -229,6 +229,30 @@ pub struct DetectedMode {
     pub refresh: u32,
 }
 
+/// What the daemon decides per tablet once it knows which tablet a pipeline
+/// serves. Shared with the pipeline and read when it starts or places its
+/// screen, so a pipeline can change tablets without being rebuilt.
+#[derive(Clone)]
+pub struct Pins {
+    /// EVDI card for the next helper.
+    pub card: Arc<std::sync::Mutex<Option<u32>>>,
+    /// Where the screen goes; wins over `CaptureConfig::position`.
+    pub position: Arc<std::sync::Mutex<Option<crate::config::Position>>>,
+    /// Serial number for the screen's EDID (0 = the default), which is what
+    /// lets KDE tell two tablets' screens apart.
+    pub edid_serial: Arc<std::sync::Mutex<u32>>,
+}
+
+impl Pins {
+    fn new() -> Self {
+        Self {
+            card: Arc::new(std::sync::Mutex::new(None)),
+            position: Arc::new(std::sync::Mutex::new(None)),
+            edid_serial: Arc::new(std::sync::Mutex::new(0)),
+        }
+    }
+}
+
 pub struct CaptureManager {
     config: CaptureConfig,
     helper_child: Option<Child>,
@@ -255,6 +279,11 @@ pub struct CaptureManager {
     /// Published once the helper reports which card it opened, for whoever
     /// needs to address this tablet's output (the input mapping does).
     card_tx: watch::Sender<Option<u32>>,
+    /// Card to pin the next helper to, set by the daemon once it knows which
+    /// tablet this pipeline serves. Read each time a helper is started, so it
+    /// takes effect the next time the tablet comes up. Wins over
+    /// `config.card`.
+    pins: Pins,
     latency: crate::latency::LatencyTracker,
     /// Set by the stream server when a client attaches. The in-process encoder
     /// turns the next frame into a keyframe, so a client joining an idle screen
@@ -263,6 +292,18 @@ pub struct CaptureManager {
     #[cfg_attr(not(feature = "inproc-encoder"), allow(dead_code))]
     idr_wanted: Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// Held while one pipeline reads the desktop's output layout and changes it.
+/// With several tablets each pipeline enables its own virtual screen, and two
+/// doing it at once both worked from the same snapshot of the layout, placed
+/// their screens on top of each other, and had KWin reconfigure underneath
+/// one another — which left one of them never activated.
+/// How long the encoder's output may stay silent before what has arrived is
+/// taken to be a finished frame.
+#[cfg_attr(feature = "inproc-encoder", allow(dead_code))]
+const IDLE_FLUSH_MS: u64 = 10;
+
+static LAYOUT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 impl CaptureManager {
     pub fn new(config: CaptureConfig) -> Self {
@@ -280,9 +321,25 @@ impl CaptureManager {
             helper_stdout_task: None,
             helper_card: None,
             card_tx: watch::channel(None).0,
+            pins: Pins::new(),
             latency: crate::latency::LatencyTracker::new(),
             idr_wanted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Handles for choosing this pipeline's card, screen position and EDID
+    /// identity per tablet.
+    pub fn pins(&self) -> Pins {
+        self.pins.clone()
+    }
+
+    fn screen_position(&self) -> crate::config::Position {
+        self.pins
+            .position
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .unwrap_or(self.config.position)
     }
 
     /// Which EVDI card the helper opened; None until it has.
@@ -350,12 +407,130 @@ impl CaptureManager {
     ///
     /// The position is derived at runtime from the existing display geometry so
     /// it works regardless of the laptop's screen resolution or scaling factor.
-    async fn enable_evdi_display(card: Option<u32>, position: crate::config::Position) {
-        let evdi_names: Vec<String> = crate::vdisplay::evdi_connectors()
+    /// Connector names of the EVDI card (or of every EVDI card).
+    fn evdi_names_for(card: Option<u32>) -> Vec<String> {
+        crate::vdisplay::evdi_connectors()
             .into_iter()
             .filter(|c| card.is_none_or(|want| c.card == want))
             .map(|c| c.name)
+            .collect()
+    }
+
+    /// Whether KDE currently has output `id` enabled; None when it cannot say.
+    async fn kscreen_output_enabled(id: u32) -> Option<bool> {
+        let o = tokio::process::Command::new("kscreen-doctor")
+            .arg("-j")
+            .output()
+            .await
+            .ok()?;
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).ok()?;
+        v.get("outputs")?
+            .as_array()?
+            .iter()
+            .find(|out| out.get("id").and_then(|v| v.as_u64()) == Some(id as u64))?
+            .get("enabled")?
+            .as_bool()
+    }
+
+    /// Whether KDE has this tablet's virtual output somewhere it should not be:
+    /// switched off, sitting on top of another screen, or (when exact
+    /// coordinates were asked for) not at them. False on every other desktop
+    /// and whenever it cannot tell.
+    async fn evdi_output_needs_fix(card: Option<u32>, position: crate::config::Position) -> bool {
+        if crate::hyprland::active()
+            || crate::cosmic::active()
+            || crate::gnome::active()
+            || crate::x11::active()
+        {
+            return false;
+        }
+        let names = Self::evdi_names_for(card);
+        if names.is_empty() {
+            return false;
+        }
+        let all_evdi = Self::evdi_names_for(None);
+        let Ok(o) = tokio::process::Command::new("kscreen-doctor")
+            .arg("-j")
+            .output()
+            .await
+        else {
+            return false;
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&o.stdout) else {
+            return false;
+        };
+        let Some(outputs) = v.get("outputs").and_then(|o| o.as_array()) else {
+            return false;
+        };
+
+        // (id, name, enabled, x, y, logical w, logical h)
+        let rows: Vec<(u32, String, bool, i64, i64, i64, i64)> = outputs
+            .iter()
+            .map(|out| {
+                let sc = out.get("scale").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                let logical = |v: i64| if sc > 0.0 { (v as f64 / sc).round() as i64 } else { v };
+                (
+                    out.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    out.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    out.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+                    out.pointer("/pos/x").and_then(|v| v.as_i64()).unwrap_or(0),
+                    out.pointer("/pos/y").and_then(|v| v.as_i64()).unwrap_or(0),
+                    logical(out.pointer("/size/width").and_then(|v| v.as_i64()).unwrap_or(0)),
+                    logical(out.pointer("/size/height").and_then(|v| v.as_i64()).unwrap_or(0)),
+                )
+            })
             .collect();
+
+        // Top-left of the real screens: what exact coordinates count from.
+        let real: Vec<&(u32, String, bool, i64, i64, i64, i64)> = rows
+            .iter()
+            .filter(|r| r.2 && !all_evdi.iter().any(|n| *n == r.1))
+            .collect();
+        let origin = (
+            real.iter().map(|r| r.3).min().unwrap_or(0),
+            real.iter().map(|r| r.4).min().unwrap_or(0),
+        );
+
+        for mine in rows.iter().filter(|r| names.iter().any(|n| *n == r.1)) {
+            if !mine.2 {
+                return true;
+            }
+            if let crate::config::Position::At(x, y) = position {
+                if (mine.3, mine.4) != (origin.0 + x, origin.1 + y) {
+                    return true;
+                }
+            }
+            // With "auto" where the screen sits is the desktop's business.
+            let overlaps = position != crate::config::Position::Auto
+                && rows.iter().any(|other| {
+                other.0 != mine.0
+                    && other.2
+                    && mine.3 < other.3 + other.5
+                    && other.3 < mine.3 + mine.5
+                    && mine.4 < other.4 + other.6
+                    && other.4 < mine.4 + mine.6
+            });
+            if overlaps {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn enable_evdi_display(card: Option<u32>, position: crate::config::Position) {
+        let mut evdi_names = Self::evdi_names_for(card);
+        // Every EVDI output, whichever tablet it belongs to: exact
+        // coordinates count from the real screens only.
+        let all_evdi_names = Self::evdi_names_for(None);
+        // The connector shows up in sysfs a moment after the helper reports
+        // its card, and slower still when another tablet is starting too.
+        for _ in 0..15 {
+            if !evdi_names.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            evdi_names = Self::evdi_names_for(card);
+        }
         if evdi_names.is_empty() {
             warn!("No EVDI connector found in sysfs — cannot enable the virtual display");
             return;
@@ -383,10 +558,15 @@ impl CaptureManager {
         // unconditionally, even when piped to a non-tty, which broke the
         // old line-based "Output:"/"Geometry:" parser (it silently matched
         // nothing, since every line actually starts with an escape code).
-        for attempt in 0..15 {
+        // KWin can take several seconds to register a new EVDI output,
+        // longer with two starting together; giving up after three used to
+        // leave the virtual display off for the rest of the session.
+        for attempt in 0..40 {
             if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
+            // One pipeline at a time reads and changes the layout.
+            let _layout = LAYOUT_LOCK.lock().await;
             let Ok(o) = tokio::process::Command::new("kscreen-doctor")
                 .arg("-j")
                 .output()
@@ -412,6 +592,14 @@ impl CaptureManager {
             // needed, not just the right one.
             let mut have_any = false;
             let (mut min_x, mut min_y, mut max_x, mut max_y) = (0i64, 0i64, 0i64, 0i64);
+            // Top-left corner of the real (non-EVDI) screens. Exact
+            // coordinates are measured from here rather than from the whole
+            // layout: another tablet placed left of or above everything
+            // shifts the layout, and coordinates tied to the layout's own
+            // corner then slid out from under their screens and onto
+            // each other.
+            let mut real_any = false;
+            let (mut real_min_x, mut real_min_y) = (0i64, 0i64);
 
             for out in outputs {
                 let id = out.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -442,6 +630,16 @@ impl CaptureManager {
                     // screen (e.g. a 2560px-wide physical panel at
                     // 1.35x scale is only ~1897 logical px wide).
                     others.push((id, x, y));
+                    if !all_evdi_names.iter().any(|n| n == name) {
+                        if real_any {
+                            real_min_x = real_min_x.min(x);
+                            real_min_y = real_min_y.min(y);
+                        } else {
+                            real_any = true;
+                            real_min_x = x;
+                            real_min_y = y;
+                        }
+                    }
                     if have_any {
                         min_x = min_x.min(x);
                         min_y = min_y.min(y);
@@ -472,6 +670,9 @@ impl CaptureManager {
                     Left => (min_x - evdi_w, min_y),
                     Above => (min_x, min_y - evdi_h),
                     Below => (min_x, max_y),
+                    At(x, y) => (real_min_x + x, real_min_y + y),
+                    // Stay where the desktop put it.
+                    Auto => (x, y),
                 }
             };
 
@@ -490,8 +691,10 @@ impl CaptureManager {
             // switch would add another band of empty space. Shifting every
             // output by the same amount changes no adjacency and nothing the
             // user can see — the coordinates are internal bookkeeping.
-            let shift_x = -want_x.min(min_x);
-            let shift_y = -want_y.min(min_y);
+            // With "auto" nothing is placed, so nothing is shifted either.
+            let auto = matches!(position, crate::config::Position::Auto);
+            let shift_x = if auto { 0 } else { -want_x.min(min_x) };
+            let shift_y = if auto { 0 } else { -want_y.min(min_y) };
             let (want_x, want_y) = (want_x + shift_x, want_y + shift_y);
             let moves: Vec<(u32, i64, i64)> = others
                 .iter()
@@ -506,10 +709,14 @@ impl CaptureManager {
                 return;
             }
 
-            info!(
-                "Enabling EVDI output.{} at ({}, {}) — {:?} of the other screens",
-                id, want_x, want_y, position
-            );
+            if auto {
+                info!("Enabling EVDI output.{} — its position is left to the desktop", id);
+            } else {
+                info!(
+                    "Enabling EVDI output.{} at ({}, {}) — {}",
+                    id, want_x, want_y, position.describe()
+                );
+            }
             if shift_x != 0 || shift_y != 0 {
                 info!(
                     "  Shifting the other screens by ({}, {}) to keep the layout at the origin",
@@ -519,26 +726,36 @@ impl CaptureManager {
             // All args in one kscreen-doctor call so KDE applies them atomically.
             // Position syntax is "X,Y" (comma-separated).
             let mut cmd = tokio::process::Command::new("kscreen-doctor");
-            cmd.arg(format!("output.{}.enable", id))
-                .arg(format!("output.{}.position.{},{}", id, want_x, want_y));
+            cmd.arg(format!("output.{}.enable", id));
+            if !auto {
+                cmd.arg(format!("output.{}.position.{},{}", id, want_x, want_y));
+            }
             if shift_x != 0 || shift_y != 0 {
                 for (oid, nx, ny) in &moves {
                     cmd.arg(format!("output.{}.position.{},{}", oid, nx, ny));
                 }
             }
-            let r = cmd.output().await;
-            match r {
-                Ok(o) if o.status.success() => info!("kscreen-doctor enable+position: ok"),
+            match cmd.output().await {
+                Ok(o) if o.status.success() => {
+                    // Success only means the request was accepted. KWin has
+                    // been seen to accept it and leave the output off, so
+                    // look, and go round again if it is still disabled.
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    if Self::kscreen_output_enabled(id).await != Some(false) {
+                        info!("kscreen-doctor enable+position: ok");
+                        return;
+                    }
+                    warn!("EVDI output.{} is still disabled after enabling it — retrying", id);
+                }
                 Ok(o) => warn!(
-                    "kscreen-doctor failed: {}",
+                    "kscreen-doctor failed: {} — retrying",
                     String::from_utf8_lossy(&o.stderr).trim()
                 ),
-                Err(e) => warn!("kscreen-doctor error: {}", e),
+                Err(e) => warn!("kscreen-doctor error: {} — retrying", e),
             }
-            return;
         }
 
-        warn!("EVDI output did not appear in kscreen-doctor within 3s");
+        warn!("Could not enable the EVDI output (it never appeared enabled in kscreen-doctor within ~10s)");
     }
 
     /// Turn the virtual output back off so its windows return to the real
@@ -568,6 +785,7 @@ impl CaptureManager {
             crate::x11::disable_output(&evdi_names).await;
             return;
         }
+        let _layout = LAYOUT_LOCK.lock().await;
         let Ok(o) = tokio::process::Command::new("kscreen-doctor")
             .arg("-j")
             .output()
@@ -649,6 +867,13 @@ impl CaptureManager {
                 edid_fps,
                 self.config.width_mm,
                 self.config.height_mm,
+                self.pins
+                    .edid_serial
+                    .lock()
+                    .ok()
+                    .map(|g| *g)
+                    .filter(|v| *v != 0)
+                    .unwrap_or(crate::edid::DEFAULT_SERIAL),
             )?,
         };
 
@@ -660,7 +885,14 @@ impl CaptureManager {
         }
 
         cmd.args(["--capture-fifo", &fifo]);
-        if let Some(card) = self.config.card {
+        let wanted_card = self
+            .pins
+            .card
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .or(self.config.card);
+        if let Some(card) = wanted_card {
             cmd.args(["--card", &card.to_string()]);
         }
 
@@ -966,6 +1198,12 @@ impl CaptureManager {
         }
 
         encoder_args.extend_from_slice(&[
+            // Hand each packet to the pipe the moment it is encoded. Left to
+            // its default ffmpeg may keep a small frame in its output buffer
+            // until more data follows, and on a quiet screen "more" is a
+            // long time away.
+            "-flush_packets".into(),
+            "1".into(),
             "-f".into(),
             codec.muxer().into(),
             "pipe:1".into(),
@@ -1104,7 +1342,7 @@ impl CaptureManager {
             // nobody can see, and KDE happily moves windows onto it. The
             // display_rx branch below enables it the moment that changes.
             if *display_rx.borrow() {
-                Self::enable_evdi_display(self.helper_card, self.config.position).await;
+                Self::enable_evdi_display(self.helper_card, self.screen_position()).await;
             }
 
             // Wait (briefly) for the helper to report the mode the compositor
@@ -1265,7 +1503,7 @@ impl CaptureManager {
                     let wanted = *display_rx.borrow();
                     if wanted {
                         info!("Tablet is a screen — enabling the virtual display");
-                        Self::enable_evdi_display(card, self.config.position).await;
+                        Self::enable_evdi_display(card, self.screen_position()).await;
                         resume_same_encoder = true;
                     } else {
                         // Disable first so KWin moves the windows off it, then
@@ -1276,6 +1514,21 @@ impl CaptureManager {
                         Self::disable_evdi_display(card).await;
                         display_dropped = true;
                     }
+                }
+                // Enabling the output once is not enough on KDE: its display
+                // daemon applies a saved layout when a screen appears and can
+                // switch our output off again after we have turned it on, at
+                // a moment that varies from run to run. While the tablet is
+                // meant to be a screen, look every few seconds and turn it
+                // back on if that has happened.
+                _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {
+                    if *display_rx.borrow()
+                        && Self::evdi_output_needs_fix(card, self.screen_position()).await
+                    {
+                        warn!("The virtual display is switched off, moved or on top of another screen — putting it back");
+                        Self::enable_evdi_display(card, self.screen_position()).await;
+                    }
+                    resume_same_encoder = true;
                 }
                 _ = shutdown_rx.changed() => {
                     info!("Shutdown requested — tearing down the capture pipeline");
@@ -1404,10 +1657,32 @@ impl CaptureManager {
         let mut config_extracted = codec_config.lock().ok().and_then(|g| g.clone()).is_some();
 
         loop {
-            let n = stdout
-                .read(&mut buf)
-                .await
-                .context("Read error from encoder")?;
+            // A raw H.264/HEVC stream has no frame boundaries: the packetizer
+            // only knows a frame has ended when the NEXT one begins. At 60
+            // fps that is 16 ms away; on a quiet screen frames come only when
+            // something changes (or on the idle keepalive), so every frame
+            // sat unsent until the next one — the stream looked like a few
+            // frames a second however fast the screen was really changing.
+            // ffmpeg writes a frame as one burst, so a short silence means
+            // what has arrived is a whole frame: send it now.
+            let n = match tokio::time::timeout(
+                std::time::Duration::from_millis(IDLE_FLUSH_MS),
+                stdout.read(&mut buf),
+            )
+            .await
+            {
+                Ok(read) => read.context("Read error from encoder")?,
+                Err(_) => {
+                    for data in packetizer.flush_idle() {
+                        frames += 1;
+                        if tx.receiver_count() > 0 {
+                            latency.on_encoded(data.seq);
+                            let _ = tx.send(data);
+                        }
+                    }
+                    continue;
+                }
+            };
 
             if n == 0 {
                 for data in packetizer.finish() {
@@ -1562,6 +1837,16 @@ impl H264AnnexBPacketizer {
             out.push(access_unit);
         }
         out
+    }
+
+    /// The stream has gone quiet: treat everything received so far as
+    /// complete and release it, instead of waiting for the next frame's start
+    /// code to prove that it is.
+    fn flush_idle(&mut self) -> Vec<VideoPacket> {
+        if self.buffer.is_empty() && !self.pending_has_vcl {
+            return Vec::new();
+        }
+        self.finish()
     }
 
     fn codec_config(&self) -> Option<Bytes> {

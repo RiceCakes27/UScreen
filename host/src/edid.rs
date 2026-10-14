@@ -31,6 +31,7 @@ pub fn make_edid_sized(
     refresh: u32,
     width_mm: u32,
     height_mm: u32,
+    serial: u32,
 ) -> Vec<u8> {
     let mut edid = vec![0u8; 128];
 
@@ -44,7 +45,12 @@ pub fn make_edid_sized(
 
     // Product code / serial
     edid[10] = 0x01;
-    edid[12..16].copy_from_slice(&1u32.to_le_bytes());
+    // Every tablet's screen carries its own serial. With one fixed number,
+    // two tablets of the same size had byte-identical EDIDs, and KDE — which
+    // remembers and restores layouts per monitor identity — could not tell
+    // them apart: it put both at the same position, on top of each other, and
+    // put them back there on every reconnect.
+    edid[12..16].copy_from_slice(&serial.to_le_bytes());
 
     edid[16] = 0; // week
     edid[17] = 34; // year (2024-1990)
@@ -134,7 +140,23 @@ pub fn make_edid_sized(
 /// Build an EDID at the default physical size.
 #[cfg(test)]
 pub fn make_edid(width: u32, height: u32, refresh: u32) -> Vec<u8> {
-    make_edid_sized(width, height, refresh, DEFAULT_WIDTH_MM, DEFAULT_HEIGHT_MM)
+    make_edid_sized(width, height, refresh, DEFAULT_WIDTH_MM, DEFAULT_HEIGHT_MM, DEFAULT_SERIAL)
+}
+
+/// The serial used when nothing says which tablet this is.
+pub const DEFAULT_SERIAL: u32 = 1;
+
+/// A stable EDID serial for the tablet with this adb serial, so the same
+/// tablet is recognised as the same monitor every time it is plugged in and
+/// two tablets never share one. Never 0, which many readers treat as "none".
+pub fn serial_for(tablet_serial: &str) -> u32 {
+    // FNV-1a
+    let mut h: u32 = 0x811c_9dc5;
+    for b in tablet_serial.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    if h == 0 { DEFAULT_SERIAL } else { h }
 }
 
 /// Bumped whenever the generator changes. It is part of the cache filename so
@@ -149,13 +171,14 @@ pub fn ensure_edid_sized(
     refresh: u32,
     width_mm: u32,
     height_mm: u32,
+    serial: u32,
 ) -> Result<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     let dir = PathBuf::from(home).join(".local/share/uscreen/edid");
     std::fs::create_dir_all(&dir).context("create EDID dir")?;
     let path = dir.join(format!(
-        "auto-v{}-{}x{}@{}-{}x{}mm.bin",
-        EDID_GENERATION, width, height, refresh, width_mm, height_mm
+        "auto-v{}-{}x{}@{}-{}x{}mm-s{}.bin",
+        EDID_GENERATION, width, height, refresh, width_mm, height_mm, serial
     ));
     if !path.exists() {
         // Written next to its final name and renamed into place: a crash
@@ -165,7 +188,7 @@ pub fn ensure_edid_sized(
         let tmp = path.with_extension("bin.tmp");
         std::fs::write(
             &tmp,
-            make_edid_sized(width, height, refresh, width_mm, height_mm),
+            make_edid_sized(width, height, refresh, width_mm, height_mm, serial),
         )
         .context("write EDID")?;
         std::fs::rename(&tmp, &path).context("place EDID")?;
@@ -185,7 +208,7 @@ pub fn ensure_edid_sized(
 /// Write (or reuse) a generated EDID at the default physical size.
 #[allow(dead_code)]
 pub fn ensure_edid(width: u32, height: u32, refresh: u32) -> Result<PathBuf> {
-    ensure_edid_sized(width, height, refresh, DEFAULT_WIDTH_MM, DEFAULT_HEIGHT_MM)
+    ensure_edid_sized(width, height, refresh, DEFAULT_WIDTH_MM, DEFAULT_HEIGHT_MM, DEFAULT_SERIAL)
 }
 
 #[cfg(test)]

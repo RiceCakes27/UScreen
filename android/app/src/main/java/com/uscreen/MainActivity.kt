@@ -50,6 +50,16 @@ class MainActivity : ComponentActivity() {
         // Keep screen on while streaming
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
+        // The manifest's showWhenLocked/turnScreenOn attributes only exist
+        // from API 27; older releases need the window flags instead.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O_MR1) {
+            @Suppress("DEPRECATION")
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+            )
+        }
+
         requestHighestRefreshRate()
 
         prefs = Prefs(this)
@@ -143,7 +153,13 @@ class MainActivity : ComponentActivity() {
 
         // Start foreground service to prevent Samsung from killing us
         val serviceIntent = Intent(this, StreamingService::class.java)
-        startForegroundService(serviceIntent)
+        // startForegroundService() only exists from API 26; below that a
+        // plain startService() is the equivalent.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent)
+        } else {
+            startService(serviceIntent)
+        }
 
         // Enable fullscreen AFTER setContent so DecorView exists
         window.decorView.post {
@@ -513,21 +529,22 @@ fun UScreenMain(
             }
         }
 
-        // Subtle settings handle (top-right). Sits above the video surface, so
-        // taps here are NOT forwarded to the Linux host.
-        Box(
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(10.dp)
-                .size(38.dp)
-                // Dimmer still while the screen is blanked: it is the one thing
-                // left lit on an OLED panel.
-                .alpha(if (penOnly && blankInPenMode) 0.18f else if (isConnected) 0.35f else 0.9f)
-                .clip(CircleShape)
-                .background(Color(0xAA20202C))
-                .clickable { showSettings = true },
-            contentAlignment = Alignment.Center
-        ) {
+        // Subtle settings handle (top-right). Hidden while a stream is live so
+        // nothing sits over the picture; it returns when the stream drops.
+        // Sits above the video surface, so taps here are NOT forwarded to
+        // the Linux host.
+        if (!isConnected) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(10.dp)
+                    .size(38.dp)
+                    .alpha(0.9f)
+                    .clip(CircleShape)
+                    .background(Color(0xAA20202C))
+                    .clickable { showSettings = true },
+                contentAlignment = Alignment.Center
+            ) {
             Text("⚙", fontSize = 18.sp, color = Color.White)
         }
 

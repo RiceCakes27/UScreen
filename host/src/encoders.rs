@@ -86,12 +86,17 @@ fn setup_args(encoder: &str, vaapi_device: &str) -> Vec<String> {
         ],
         _ => vec![],
     }
+    nodes.sort();
+    nodes.into_iter().map(|(_, path)| path).collect()
 }
 
 /// Encode one 256x144 frame with `encoder`, bounded to a few seconds.
 /// The error is ffmpeg's own last line, which is what a bug report needs —
 /// "cannot encode" alone does not say whether the driver, the device node
 /// or the ffmpeg build is at fault.
+///
+/// VAAPI is tried on each render node in turn, and the one that works is
+/// remembered for the real encode.
 pub async fn probe(encoder: &str) -> Result<(), String> {
     if encoder.contains("vaapi") {
         ensure_vaapi_device(&crate::config::FileConfig::load().vaapi_device).await;
