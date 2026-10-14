@@ -946,6 +946,28 @@ private fun SettingsSheet(
                     colors = SwitchDefaults.colors(checkedTrackColor = Accent)
                 )
             }
+            Spacer(Modifier.height(20.dp))
+
+            // Fingers or pen only. Applies at once; the host never sees it.
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Touch input", fontSize = 14.sp, color = Color(0xFFB0B0C0))
+                    Text(
+                        "Off sends only the pen, which keeps a resting hand from doing anything",
+                        fontSize = 11.sp,
+                        color = Color(0xFF6A6A7E)
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Switch(
+                    checked = touchEnabled,
+                    onCheckedChange = onTouchEnabledChange,
+                    colors = SwitchDefaults.colors(checkedTrackColor = Accent)
+                )
+            }
             Spacer(Modifier.height(24.dp))
 
             if (!penOnly) {
