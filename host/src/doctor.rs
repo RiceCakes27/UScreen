@@ -167,6 +167,13 @@ async fn check_tools(r: &mut Report, cfg: &FileConfig) {
                 &format!("{} cannot encode on this machine", cfg.encoder),
             );
             r.hint(&format!("ffmpeg: {}", why));
+            if cfg.encoder.contains("vaapi") {
+                r.hint(
+                    "VAAPI needs a working driver (mesa/libva-mesa-driver for AMD, intel-media-driver for Intel); \
+                     check `vainfo --display drm --device /dev/dri/renderD129`, and force a node with \
+                     USCREEN_VAAPI_DEVICE=/dev/dri/renderD129",
+                );
+            }
             let mut alternatives = Vec::new();
             for e in crate::encoders::CANDIDATES {
                 if e != cfg.encoder && crate::encoders::works(e).await {
@@ -342,7 +349,16 @@ async fn check_tablet(r: &mut Report, cfg: &FileConfig) {
             // launched there, so watching the other one shows a black screen.
             // Only the second kind has more than one USB serial.
             let usb: Vec<&&str> = devices.iter().filter(|d| !crate::is_network_serial(d)).collect();
-            if usb.len() > 1 {
+            let max_tablets = crate::config::FileConfig::load().max_tablets as usize;
+            if usb.len() > 1 && usb.len() <= max_tablets {
+                // Several tablets are expected: max_tablets gives each its own
+                // screen, so this is not a problem to warn about.
+                r.line(
+                    Level::Ok,
+                    "tablet",
+                    &format!("{} Android devices attached (max_tablets = {})", usb.len(), max_tablets),
+                );
+            } else if usb.len() > 1 {
                 let mut named = Vec::new();
                 for d in &devices {
                     match output_of("adb", &["-s", d, "shell", "getprop", "ro.product.model"]).await {
@@ -771,6 +787,30 @@ fn check_config(r: &mut Report, cfg: &FileConfig) {
         .ok()
         .and_then(|t| toml::from_str(&t).ok());
     r.line(Level::Ok, "config file", &format!("{}", path.display()));
+    {
+        let devices = crate::vdisplay::evdi_devices();
+        if !devices.is_empty() {
+            let list = devices
+                .iter()
+                .map(|(n, c)| format!("evdi.{} = card{}", n, c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            r.line(Level::Ok, "EVDI devices", &list);
+        }
+        // Assignments that point nowhere would otherwise only show up as a
+        // warning in the daemon log when that tablet is plugged in.
+        for (serial, p) in &cfg.tablets {
+            if let Some(n) = p.evdi {
+                if !devices.iter().any(|(e, _)| *e == n) {
+                    r.line(
+                        Level::Warn,
+                        "tablet evdi",
+                        &format!("{} is assigned evdi = {}, which does not exist", serial, n),
+                    );
+                }
+            }
+        }
+    }
     if cfg.max_tablets > 1 {
         let cards = crate::vdisplay::evdi_cards().len() as u32;
         if cards >= cfg.max_tablets {
@@ -791,13 +831,27 @@ fn check_config(r: &mut Report, cfg: &FileConfig) {
     r.line(
         Level::Ok,
         "screen position",
-        match cfg.position.as_str() {
-            "left" => "left of the other screens",
-            "above" => "above the other screens",
-            "below" => "below the other screens",
-            _ => "right of the other screens",
-        },
+        &crate::config::Position::parse_or_default(&cfg.position).describe(),
     );
+    for (serial, p) in &cfg.tablets {
+        if let Some(text) = p.position.as_deref().filter(|t| !t.trim().is_empty()) {
+            match crate::config::Position::parse(text) {
+                Some(pos) => r.line(
+                    Level::Ok,
+                    "tablet position",
+                    &format!("{}: {}", serial, pos.describe()),
+                ),
+                None => r.line(
+                    Level::Warn,
+                    "tablet position",
+                    &format!(
+                        "{}: {:?} is not left, right, above, below or \"X,Y\"; the global position is used",
+                        serial, text
+                    ),
+                ),
+            }
+        }
+    }
     r.line(
         Level::Ok,
         "mode",

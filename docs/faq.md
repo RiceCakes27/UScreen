@@ -77,6 +77,59 @@ On the reference hardware: about 19–22 ms median end-to-end with H.264,
 Yes, `max_tablets` up to 4; each becomes its own screen. Verified with one
 real tablet plus a loopback stand-in — reports with two real ones welcome.
 
+To choose which EVDI device a tablet uses, add `evdi` to its block in
+`~/.config/uscreen/config.toml` (serials are in `adb devices`; the numbers are
+the `evdi.N` that `uscreen doctor` lists):
+
+```toml
+[tablets.R52WA0A0KED]
+evdi = 1
+
+[tablets.2f3c91ab]
+evdi = 0
+```
+
+Each tablet can also have its own `position`: `left`, `right`, `above` or
+`below` the other screens, or exact coordinates measured in logical pixels
+from the top-left corner of your real screens:
+
+```toml
+[tablets.R52WA0A0KED]
+position = "2560,0"
+
+[tablets.2f3c91ab]
+position = "-1280,360"
+```
+
+Negative coordinates are fine: the layout is shifted back to the origin
+afterwards, and the coordinates keep counting from your real screens, so
+they do not move when another tablet is added or removed. The daemon puts a
+screen back at its coordinates if KDE moves it. Check where each screen landed with `uscreen doctor`.
+
+Set `position = "auto"` (for one tablet, or globally) to stop UScreen placing
+the screen at all. The desktop then decides where it goes and, because every
+tablet has its own identity, remembers it for next time. UScreen still
+switches the screen on if it is off, and never moves it or the other screens.
+
+Restart the daemon afterwards. A tablet pointed at an EVDI device that does
+not exist, or that another tablet is already on, is not started, and the log
+says why.
+
 **How do I uninstall UScreen completely?**
 The exact commands, including the system files the installer creates, are in
 [SECURITY.md](../SECURITY.md#how-to-uninstall-completely).
+
+## VAAPI keeps switching back to NVENC
+
+At start the daemon encodes one test frame with the configured encoder. For
+`h264_vaapi` it tries each `/dev/dri/renderD*` node, AMD and Intel GPUs first,
+and uses the one that works. If none does, the stream runs on a working
+encoder for that session and your config is left alone. `uscreen doctor`
+prints ffmpeg's error for every node it tried.
+
+To use a particular node, set `USCREEN_VAAPI_DEVICE=/dev/dri/renderD129` in
+the daemon's environment (`systemctl --user edit uscreen`, then add
+`[Service]` and `Environment=USCREEN_VAAPI_DEVICE=/dev/dri/renderD129`).
+`vainfo --display drm --device /dev/dri/renderD129` shows whether that node
+has a working VAAPI driver; on Arch that is `libva-mesa-driver` (AMD) or
+`intel-media-driver` (Intel).

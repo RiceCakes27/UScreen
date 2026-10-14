@@ -50,6 +50,16 @@ class MainActivity : ComponentActivity() {
         // Keep screen on while streaming
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
+        // The manifest's showWhenLocked/turnScreenOn attributes only exist
+        // from API 27; older releases need the window flags instead.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O_MR1) {
+            @Suppress("DEPRECATION")
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+            )
+        }
+
         requestHighestRefreshRate()
 
         prefs = Prefs(this)
@@ -143,7 +153,13 @@ class MainActivity : ComponentActivity() {
 
         // Start foreground service to prevent Samsung from killing us
         val serviceIntent = Intent(this, StreamingService::class.java)
-        startForegroundService(serviceIntent)
+        // startForegroundService() only exists from API 26; below that a
+        // plain startService() is the equivalent.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent)
+        } else {
+            startService(serviceIntent)
+        }
 
         // Enable fullscreen AFTER setContent so DecorView exists
         window.decorView.post {
@@ -512,19 +528,22 @@ fun UScreenMain(
             }
         }
 
-        // Subtle settings handle (top-right). Sits above the video surface, so
-        // taps here are NOT forwarded to the Linux host.
-        Box(
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(10.dp)
-                .size(38.dp)
-                .alpha(if (isConnected) 0.35f else 0.9f)
-                .clip(CircleShape)
-                .background(Color(0xAA20202C))
-                .clickable { showSettings = true },
-            contentAlignment = Alignment.Center
-        ) {
+        // Settings handle (top-right). Hidden while a stream is live so
+        // nothing sits over the picture; it returns when the stream drops.
+        // Sits above the video surface, so taps here are NOT forwarded to
+        // the Linux host.
+        if (!isConnected) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(10.dp)
+                    .size(38.dp)
+                    .alpha(0.9f)
+                    .clip(CircleShape)
+                    .background(Color(0xAA20202C))
+                    .clickable { showSettings = true },
+                contentAlignment = Alignment.Center
+            ) {
             Text("⚙", fontSize = 18.sp, color = Color.White)
         }
 
@@ -924,28 +943,6 @@ private fun SettingsSheet(
                 Switch(
                     checked = showStats,
                     onCheckedChange = onShowStatsChange,
-                    colors = SwitchDefaults.colors(checkedTrackColor = Accent)
-                )
-            }
-            Spacer(Modifier.height(20.dp))
-
-            // Fingers or pen only. Applies at once; the host never sees it.
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("Touch input", fontSize = 14.sp, color = Color(0xFFB0B0C0))
-                    Text(
-                        "Off sends only the pen, which keeps a resting hand from doing anything",
-                        fontSize = 11.sp,
-                        color = Color(0xFF6A6A7E)
-                    )
-                }
-                Spacer(Modifier.width(12.dp))
-                Switch(
-                    checked = touchEnabled,
-                    onCheckedChange = onTouchEnabledChange,
                     colors = SwitchDefaults.colors(checkedTrackColor = Accent)
                 )
             }

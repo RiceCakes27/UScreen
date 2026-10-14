@@ -201,7 +201,18 @@ async fn run_daemon(cli: Cli) -> Result<()> {
         Some(e) => e,
         None => match encoders::resolve(&file_cfg.encoder).await {
             Some(e) => {
-                if e != file_cfg.encoder {
+                // Only a config that still holds the stock default is
+                // rewritten. Anything else was chosen by the user, and
+                // silently swapping it back (a VAAPI choice turned into
+                // NVENC because of one failed test frame) is worse than
+                // using the working encoder for this run and saying so.
+                let was_alias = file_cfg.encoder == "vaapih264enc" && e == "h264_vaapi";
+                if e != file_cfg.encoder && file_cfg.encoder != "h264_nvenc" && !was_alias {
+                    warn!(
+                        "Using {} for this run: the configured {} did not work. The config is left as it is — see `uscreen doctor`.",
+                        e, file_cfg.encoder
+                    );
+                } else if e != file_cfg.encoder {
                     let mut fixed = file_cfg.clone();
                     fixed.encoder = e.clone();
                     match fixed.save() {
@@ -302,6 +313,7 @@ async fn run_daemon(cli: Cli) -> Result<()> {
     });
 
     let mut capture_mgr = capture::CaptureManager::new(cap_config);
+    let primary_pins = capture_mgr.pins();
     let card_rx = capture_mgr.card_rx();
     let codec_config = capture_mgr.codec_config_arc();
     let latency = capture_mgr.latency_tracker();
@@ -517,7 +529,7 @@ async fn run_daemon(cli: Cli) -> Result<()> {
     let wifi_address = file_cfg.wifi_address.clone();
     let settings_tx_adb = settings_tx.clone();
     let adb_handle = tokio::spawn(async move {
-        adb_monitor(video_port, input_port, auto_launch, tablet_tx, adb_token, relaunch, extra, wifi_address, settings_tx_adb, serial_tx).await;
+        adb_monitor(video_port, input_port, auto_launch, tablet_tx, adb_token, relaunch, extra, wifi_address, settings_tx_adb, serial_tx, primary_pins).await;
     });
 
     println!();
@@ -728,8 +740,137 @@ struct ExtraSessionTemplate {
     shutdown_rx: watch::Receiver<bool>,
 }
 
+/// The position set for this tablet in its `[tablets.<serial>]` block, if it
+/// has one that makes sense.
+fn tablet_position(serial: &str) -> Option<config::Position> {
+    let cfg = config::FileConfig::load();
+    let text = cfg.tablets.get(serial)?.position.as_deref()?.trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    match config::Position::parse(&text) {
+        Some(p) => Some(p),
+        None => {
+            warn!(
+                "Tablet {} has position {:?}, which is not left, right, above, below or \"X,Y\" — using the global position",
+                serial, text
+            );
+            None
+        }
+    }
+}
+
+/// Point the first tablet's pipeline at the EVDI card and screen position for
+/// `serial`. Without several tablets or an explicit assignment the helper
+/// keeps choosing its card for itself, as it always has.
+fn pin_primary_card(
+    serial: &str,
+    extras: &std::collections::HashMap<String, ExtraSession>,
+    max_tablets: u32,
+    pins: &capture::Pins,
+    in_use: &mut Option<u32>,
+    position_in_use: &mut Option<config::Position>,
+) {
+    let position = tablet_position(serial);
+    if let Ok(mut g) = pins.position.lock() {
+        *g = position;
+    }
+    *position_in_use = position;
+    // This tablet's own identity for the desktop, so its virtual screen is
+    // never mistaken for another tablet's.
+    if let Ok(mut g) = pins.edid_serial.lock() {
+        *g = edid::serial_for(serial);
+    }
+    let handle = &pins.card;
+    let chosen = if max_tablets > 1 || has_evdi_assignment(serial) {
+        let used: Vec<u32> = extras.values().filter_map(|s| s.card).collect();
+        match resolve_card(serial, &used) {
+            Ok(card) => {
+                info!("Tablet {} uses EVDI card{}", serial, card);
+                Some(card)
+            }
+            Err(why) => {
+                warn!("{} — using the default EVDI device instead", why);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Ok(mut g) = handle.lock() {
+        *g = chosen;
+    }
+    *in_use = chosen;
+}
+
+/// Pick the EVDI card for the tablet with this serial, given the cards other
+/// pipelines already hold.
+///
+/// A tablet with `evdi = N` in its `[tablets.<serial>]` block gets `evdi.N`;
+/// asking for one that does not exist, or that another tablet is already on,
+/// is an error rather than a quiet substitution. Everything else gets the
+/// lowest card that is neither in use nor promised to another tablet.
+fn resolve_card(serial: &str, used: &[u32]) -> Result<u32, String> {
+    let cfg = config::FileConfig::load();
+    let devices = vdisplay::evdi_devices();
+    let present = || {
+        devices
+            .iter()
+            .map(|(n, c)| format!("evdi.{} (card{})", n, c))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if let Some(n) = cfg.tablets.get(serial).and_then(|p| p.evdi) {
+        let Some((_, card)) = devices.iter().find(|(e, _)| *e == n) else {
+            return Err(format!(
+                "tablet {} is assigned evdi = {}, but there is no evdi.{}. Present: {}",
+                serial,
+                n,
+                n,
+                if devices.is_empty() { "none".to_string() } else { present() }
+            ));
+        };
+        if used.contains(card) {
+            return Err(format!(
+                "tablet {} is assigned evdi = {} (card{}), but another tablet is using it",
+                serial, n, card
+            ));
+        }
+        return Ok(*card);
+    }
+    // Cards promised to other tablets stay free for them.
+    let promised: Vec<u32> = cfg
+        .tablets
+        .iter()
+        .filter(|(s, _)| s.as_str() != serial)
+        .filter_map(|(_, p)| p.evdi)
+        .filter_map(|n| devices.iter().find(|(e, _)| *e == n).map(|(_, c)| *c))
+        .collect();
+    vdisplay::evdi_cards()
+        .into_iter()
+        .find(|c| !used.contains(c) && !promised.contains(c))
+        .ok_or_else(|| {
+            format!(
+                "no free EVDI device for tablet {}. Present: {}",
+                serial,
+                if devices.is_empty() { "none".to_string() } else { present() }
+            )
+        })
+}
+
+/// Whether this tablet has an explicit `evdi` assignment.
+fn has_evdi_assignment(serial: &str) -> bool {
+    config::FileConfig::load()
+        .tablets
+        .get(serial)
+        .and_then(|p| p.evdi)
+        .is_some()
+}
+
 /// One extra tablet's running pipeline.
 struct ExtraSession {
+    /// The EVDI card this pipeline is pinned to.
+    card: Option<u32>,
     instance: u32,
     /// This tablet's own settings, so its remembered panel can be applied to
     /// it and whatever it reports can be written back under its serial.
@@ -758,27 +899,40 @@ impl ExtraSession {
 /// Bring up capture, stream and input for tablet number `instance`.
 /// Ports are the base ports plus 2 per instance; the tablet side keeps
 /// using 8890/8891, since `adb reverse` maps them per device.
-fn spawn_extra_session(t: &ExtraSessionTemplate, instance: u32) -> Option<ExtraSession> {
+fn spawn_extra_session(
+    t: &ExtraSessionTemplate,
+    instance: u32,
+    serial: &str,
+    used_cards: &[u32],
+) -> Option<ExtraSession> {
     let cards = vdisplay::evdi_cards();
     let mut cfg = t.cap_template.clone();
     cfg.instance = instance;
-    // Each tablet owns one EVDI card, by slot. Starting a session without one
+    // Each tablet owns one EVDI card: the one assigned to its serial with
+    // `evdi = N`, else the first free one. Starting a session without one
     // used to leave its helper to find a free card by itself, which with
     // several starting at once means two helpers on the same card and two
     // streams of the same screen. Better to say what is missing and stop.
-    cfg.card = cards.get(instance as usize).copied();
-    if cfg.card.is_none() {
-        warn!(
-            "Tablet {} has no EVDI device of its own: {} exist, {} are wanted. \
-             Put initial_device_count={} in /etc/modprobe.d/uscreen-evdi.conf, \
-             then `sudo modprobe -r evdi && sudo modprobe evdi` or reboot.",
-            instance + 1,
-            cards.len(),
-            t.max_tablets,
-            t.max_tablets
-        );
-        return None;
+    if let Some(p) = tablet_position(serial) {
+        cfg.position = p;
     }
+    let edid_serial = edid::serial_for(serial);
+    cfg.card = match resolve_card(serial, used_cards) {
+        Ok(card) => Some(card),
+        Err(why) => {
+            warn!(
+                "Tablet {} cannot start: {}. {} EVDI device(s) exist, {} are wanted. \
+                 Put initial_device_count={} in /etc/modprobe.d/uscreen-evdi.conf, \
+                 then `sudo modprobe -r evdi && sudo modprobe evdi` or reboot.",
+                instance + 1,
+                why,
+                cards.len(),
+                t.max_tablets,
+                t.max_tablets
+            );
+            return None;
+        }
+    };
     let video_port = t.video_port + 2 * instance as u16;
     let input_port = t.input_port + 2 * instance as u16;
 
@@ -795,6 +949,10 @@ fn spawn_extra_session(t: &ExtraSessionTemplate, instance: u32) -> Option<ExtraS
     });
     let settings_tx_keep = settings_tx.clone();
     let mut cap = capture::CaptureManager::new(cfg.clone());
+    let pins = cap.pins();
+    if let Ok(mut g) = pins.edid_serial.lock() {
+        *g = edid_serial;
+    }
     let card_rx = cap.card_rx();
     let codec_config = cap.codec_config_arc();
     let latency = cap.latency_tracker();
@@ -877,6 +1035,7 @@ fn spawn_extra_session(t: &ExtraSessionTemplate, instance: u32) -> Option<ExtraS
         cfg.card.map(|c| format!(", EVDI card{}", c)).unwrap_or_default()
     );
     Some(ExtraSession {
+        card: cfg.card,
         instance,
         tablet_tx,
         relaunch,
@@ -907,8 +1066,22 @@ async fn adb_monitor(
     wifi_address: String,
     settings_tx: watch::Sender<capture::EncoderSettings>,
     serial_tx: watch::Sender<Option<String>>,
+    // Lets this loop pin the first tablet's pipeline to the EVDI device
+    // assigned to whichever tablet it turns out to be.
+    primary_pins: capture::Pins,
 ) {
     let mut current: Option<String> = None;
+    // Where the first tablet's screen was last put, to notice when a
+    // different tablet needs it somewhere else.
+    let mut primary_position_in_use: Option<config::Position> = None;
+    // Consecutive polls a tablet has been missing from `adb devices`. One or
+    // two misses is a USB or adb hiccup, not an unplugging.
+    let mut current_missing: u32 = 0;
+    let mut extra_missing: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    const MISSING_POLLS_BEFORE_DROP: u32 = 3;
+    // The EVDI card the first tablet's pipeline is using, so extra tablets
+    // never share it.
+    let mut primary_card_in_use: Option<u32> = None;
     let mut last_relaunch = std::time::Instant::now() - std::time::Duration::from_secs(60);
     // How many times the token has been re-delivered to this tablet. An app
     // too old to send one fails auth on every reconnect, and without a cap
@@ -948,7 +1121,46 @@ async fn adb_monitor(
                 }
             }
         }
-        let found = pick_device(&devices, current.as_deref()).await;
+        // A tablet already running as an extra is not a candidate for the
+        // first slot. Otherwise, when the first tablet was unplugged, the
+        // extra was picked up as the new first one: its own pipeline was
+        // stopped and rebuilt as the primary — "the other one reconnects" —
+        // and, for a few polls, two pipelines drove the same tablet, which
+        // is also when its screen ended up somewhere other than configured.
+        let candidates: Vec<String> = devices
+            .iter()
+            .filter(|d| !extras.contains_key(*d))
+            .cloned()
+            .collect();
+        let mut found = pick_device(&candidates, current.as_deref()).await;
+
+        // A tablet dropping out of `adb devices` for a poll or two is a USB or
+        // adb hiccup, and plugging a second tablet in is exactly when one
+        // happens. Treating it as an unplugging tore the pipeline down, and
+        // since the first tablet looked gone while the second was attached,
+        // the two even swapped roles. Hold the session through short gaps and
+        // put the port forwarding back when the tablet returns, because a USB
+        // reset throws it away.
+        if let Some(cur) = current.clone() {
+            if devices.iter().any(|d| *d == cur) {
+                if current_missing > 0 {
+                    info!("Tablet {} is back — restoring its port forwarding", cur);
+                    if !is_fake_serial(&cur) {
+                        if let Err(e) = setup_adb_forwarding(&cur, video_port, input_port).await {
+                            warn!("ADB forwarding failed: {}", e);
+                        }
+                    }
+                }
+                current_missing = 0;
+            } else {
+                current_missing += 1;
+                if current_missing < MISSING_POLLS_BEFORE_DROP {
+                    found = Some(cur);
+                } else {
+                    current_missing = 0;
+                }
+            }
+        }
 
         match (&current, &found) {
             // Newly attached, or a different tablet than before.
@@ -964,6 +1176,7 @@ async fn adb_monitor(
                 if !is_fake_serial(serial) {
                     on_tablet_connected(serial, video_port, input_port, auto_launch, token.as_deref()).await;
                 }
+                pin_primary_card(serial, &extras, extra.max_tablets, &primary_pins, &mut primary_card_in_use, &mut primary_position_in_use);
                 let _ = tablet_tx.send(true);
                 current = found.clone();
                 relaunches = 0;
@@ -987,6 +1200,15 @@ async fn adb_monitor(
                 let _ = serial_tx.send(Some(serial.clone()));
                 apply_tablet_profile(serial, &settings_tx).await;
                 on_tablet_connected(serial, video_port, input_port, auto_launch, token.as_deref()).await;
+                // A different tablet may belong on a different EVDI device.
+                // The helper only picks its card when it starts, so bounce the
+                // pipeline when the card changes.
+                let before = (primary_card_in_use, primary_position_in_use);
+                pin_primary_card(serial, &extras, extra.max_tablets, &primary_pins, &mut primary_card_in_use, &mut primary_position_in_use);
+                if before != (primary_card_in_use, primary_position_in_use) {
+                    let _ = tablet_tx.send(false);
+                    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                }
                 let _ = tablet_tx.send(true);
                 current = found.clone();
                 relaunches = 0;
@@ -996,6 +1218,8 @@ async fn adb_monitor(
                 info!("Tablet disconnected ({})", old);
                 let _ = serial_tx.send(None);
                 let _ = tablet_tx.send(false);
+                primary_card_in_use = None;
+                primary_position_in_use = None;
                 current = None;
             }
             _ => {}
@@ -1003,9 +1227,42 @@ async fn adb_monitor(
 
         // Further tablets. Anything beyond the first that has a free slot.
         if extra.max_tablets > 1 {
-            let others: Vec<String> = devices.iter().skip(1).cloned().collect();
+            // Everything except the tablet already being driven. `skip(1)`
+            // assumed that one is first in adb's list, but it is chosen
+            // sticky/by-app-installed, so it often is not: the driven tablet
+            // then got a second pipeline and the real second one got none.
+            let others: Vec<String> = devices
+                .iter()
+                .filter(|d| Some(d.as_str()) != current.as_deref())
+                .cloned()
+                .collect();
             // Gone
-            let gone: Vec<String> = extras.keys().filter(|k| !others.contains(k)).cloned().collect();
+            // Gone: only after several polls in a row, for the reason given
+            // above, and with the port forwarding restored if it came back.
+            let mut gone: Vec<String> = Vec::new();
+            for k in extras.keys() {
+                if others.contains(k) {
+                    if extra_missing.remove(k).unwrap_or(0) > 0 {
+                        if let Some(sess) = extras.get(k) {
+                            info!("Tablet {} is back — restoring its port forwarding", k);
+                            if !is_fake_serial(k) {
+                                if let Err(e) = setup_adb_forwarding(k, sess.video_port, sess.input_port).await {
+                                    warn!("ADB forwarding failed: {}", e);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let n = extra_missing.entry(k.clone()).or_insert(0);
+                    *n += 1;
+                    if *n >= MISSING_POLLS_BEFORE_DROP {
+                        gone.push(k.clone());
+                    }
+                }
+            }
+            for k in &gone {
+                extra_missing.remove(k);
+            }
             for serial in gone {
                 if let Some(sess) = extras.remove(&serial) {
                     info!("Tablet {} disconnected ({})", sess.instance + 1, serial);
@@ -1023,7 +1280,9 @@ async fn adb_monitor(
                     continue;
                 };
                 info!("Tablet {} connected over {} ({})", instance + 1, transport_of(&serial).label(), serial);
-                let Some(sess) = spawn_extra_session(&extra, instance) else {
+                let mut used_cards: Vec<u32> = extras.values().filter_map(|s| s.card).collect();
+                used_cards.extend(primary_card_in_use);
+                let Some(sess) = spawn_extra_session(&extra, instance, &serial, &used_cards) else {
                     continue;
                 };
                 apply_tablet_profile(&serial, &sess.settings_tx).await;
@@ -1069,15 +1328,39 @@ async fn adb_monitor(
         // again over adb is how it gets one. Rate-limited so a misbehaving
         // client cannot make us hammer adb.
         let extra_relaunch = async {
-            let notifies: Vec<_> = extras.values().map(|s| s.relaunch.clone()).collect();
+            let (serials, notifies): (Vec<String>, Vec<_>) = extras
+                .iter()
+                .map(|(k, s)| (k.clone(), s.relaunch.clone()))
+                .unzip();
             if notifies.is_empty() {
                 std::future::pending::<()>().await;
             }
             let futs = notifies.iter().map(|n| Box::pin(n.notified()));
-            futures_util::future::select_all(futs).await;
+            let (_, idx, _) = futures_util::future::select_all(futs).await;
+            serials[idx].clone()
         };
         tokio::select! {
             _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {
+                // Put the port forwarding back if a USB reset took it away
+                // without the tablet ever leaving `adb devices`.
+                let mut targets: Vec<(String, u16, u16)> = Vec::new();
+                if let Some(c) = current.as_deref() {
+                    targets.push((c.to_string(), video_port, input_port));
+                }
+                for (k, sess) in extras.iter() {
+                    targets.push((k.clone(), sess.video_port, sess.input_port));
+                }
+                for (serial, v, i) in targets {
+                    if is_fake_serial(&serial) {
+                        continue;
+                    }
+                    if forwards_present(&serial, v, i).await == Some(false) {
+                        warn!("Tablet {} lost its port forwarding (USB reset?) — restoring it", serial);
+                        if let Err(e) = setup_adb_forwarding(&serial, v, i).await {
+                            warn!("ADB forwarding failed: {}", e);
+                        }
+                    }
+                }
                 polls_since_check += 1;
                 if polls_since_check < APP_CHECK_EVERY {
                     continue;
@@ -1140,11 +1423,13 @@ async fn adb_monitor(
                     }
                 }
             }
-            _ = extra_relaunch => {
-                // Deliver the token to every extra tablet; cheap and rare.
-                for (serial, _) in extras.iter() {
-                    if std::env::var("USCREEN_FAKE_TABLET").map(|f| f.split(',').any(|x| x.trim() == serial)).unwrap_or(false) { continue; }
-                    launch_app(serial, token.as_deref()).await;
+            serial = extra_relaunch => {
+                // Deliver the token to the tablet that asked for it, and only
+                // that one: launching the app on the others makes it
+                // reconnect, which is what plugging a tablet in used to do
+                // to the one that was already working.
+                if !is_fake_serial(&serial) {
+                    launch_app(&serial, token.as_deref()).await;
                 }
             }
         }
@@ -1304,6 +1589,30 @@ async fn apply_tablet_profile(serial: &str, settings_tx: &watch::Sender<capture:
         s.width, s.height, s.width_mm, s.height_mm
     );
     let _ = settings_tx.send(s);
+}
+
+/// Whether the tablet still has both of our `adb reverse` rules. A USB reset
+/// discards them, after which the app can no longer reach the daemon even
+/// though `adb devices` looks perfectly healthy. None when adb cannot say.
+async fn forwards_present(serial: &str, host_video: u16, host_input: u16) -> Option<bool> {
+    let out = tokio::process::Command::new("adb")
+        .args(["-s", serial, "reverse", "--list"])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let has = |tablet: u16, host: u16| {
+        text.lines().any(|l| {
+            let t: Vec<&str> = l.split_whitespace().collect();
+            t.len() >= 2
+                && t[t.len() - 2] == format!("tcp:{}", tablet)
+                && t[t.len() - 1] == format!("tcp:{}", host)
+        })
+    };
+    Some(has(TABLET_VIDEO_PORT, host_video) && has(TABLET_INPUT_PORT, host_input))
 }
 
 /// Whether the app's process exists on the tablet. `None` when adb could not
@@ -1537,17 +1846,32 @@ async fn adb_device_serial() -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// The ports the app dials on its own device (VideoReceiver.PORT and
+/// TouchCapture.WS_URL). They are fixed in the app, so every tablet must be
+/// reached on these, whichever host ports its pipeline listens on.
+const TABLET_VIDEO_PORT: u16 = 8890;
+const TABLET_INPUT_PORT: u16 = 8891;
+
 async fn setup_adb_forwarding(serial: &str, video_port: u16, input_port: u16) -> Result<()> {
-    for port in [video_port, input_port] {
-        let arg = format!("tcp:{}", port);
+    // `adb reverse tcp:<tablet side> tcp:<host side>`. The second tablet's
+    // pipeline listens on 8892/8893, but its app still connects to 8890/8891
+    // on the tablet; mapping 8892 -> 8892 left it with nothing to connect to
+    // and it sat on "awaiting connection" forever.
+    for (tablet_port, host_port) in [
+        (TABLET_VIDEO_PORT, video_port),
+        (TABLET_INPUT_PORT, input_port),
+    ] {
+        let remote = format!("tcp:{}", tablet_port);
+        let local = format!("tcp:{}", host_port);
         let r = tokio::process::Command::new("adb")
-            .args(["-s", serial, "reverse", &arg, &arg])
+            .args(["-s", serial, "reverse", &remote, &local])
             .output()
             .await?;
         if !r.status.success() {
             anyhow::bail!(
-                "adb reverse {} failed: {}",
-                arg,
+                "adb reverse {} {} failed: {}",
+                remote,
+                local,
                 String::from_utf8_lossy(&r.stderr).trim()
             );
         }

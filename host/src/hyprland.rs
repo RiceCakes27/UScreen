@@ -176,10 +176,12 @@ pub async fn enable_output(names: &[String], position: crate::config::Position) 
         }
 
         let side = match position {
-            crate::config::Position::Right => "auto-right",
-            crate::config::Position::Left => "auto-left",
-            crate::config::Position::Above => "auto-up",
-            crate::config::Position::Below => "auto-down",
+            crate::config::Position::Right => "auto-right".to_string(),
+            crate::config::Position::Left => "auto-left".to_string(),
+            crate::config::Position::Above => "auto-up".to_string(),
+            crate::config::Position::Below => "auto-down".to_string(),
+            crate::config::Position::At(x, y) => format!("{}x{}", x, y),
+            crate::config::Position::Auto => "auto".to_string(),
         };
         let scale = mon.best_mode.map(|(w, h)| scale_for(w, h)).unwrap_or(1);
         info!("Hyprland left {} off — switching it on", mon.name);

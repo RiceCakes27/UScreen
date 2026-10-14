@@ -177,6 +177,9 @@ pub async fn enable_output(names: &[String], position: crate::config::Position) 
             Left => ("--left-of", edge(|g| g.2, false)),
             Above => ("--above", edge(|g| g.3, false)),
             Below => ("--below", edge(|g| g.3 + g.1, true)),
+            At(x, y) => ("--pos", Some(format!("{}x{}", x, y))),
+            // No reference screen: plain `--auto`, and X puts it where it likes.
+            Auto => ("--auto", None),
         };
         let mut args = vec!["--output", mine.name.as_str(), "--auto"];
         if let Some(r) = reference.as_deref() {

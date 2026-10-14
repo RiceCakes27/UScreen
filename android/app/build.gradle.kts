@@ -18,10 +18,10 @@ android {
 
     defaultConfig {
         applicationId = "com.uscreen"
-        minSdk = 27
+        minSdk = 23
         targetSdk = 34
-        versionCode = 18
-        versionName = "1.2.9"
+        versionCode = 17
+        versionName = "1.2.8"
     }
 
     if (keystoreProps.isNotEmpty()) {

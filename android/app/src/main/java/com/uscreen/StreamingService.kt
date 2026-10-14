@@ -34,7 +34,15 @@ class StreamingService : Service() {
             PendingIntent.FLAG_IMMUTABLE
         )
 
-        val notification = Notification.Builder(this, CHANNEL_ID)
+        // Notification channels (and the Builder constructor taking a channel
+        // id) only exist from API 26; Android 6/7 use the plain builder.
+        @Suppress("DEPRECATION")
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            Notification.Builder(this)
+        }
+        val notification = builder
             .setContentTitle("UScreen Active")
             .setContentText("Streaming display to this device")
             .setSmallIcon(android.R.drawable.ic_menu_view)
@@ -125,6 +133,7 @@ class StreamingService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val channel = NotificationChannel(
             CHANNEL_ID,
             "UScreen Streaming",

@@ -97,6 +97,15 @@ static volatile int g_buffers_ready = 0;
 #define IDLE_KEEPALIVE_MS 200
 static long long g_last_write_ms = 0;
 
+/* After a frame that really changed, send the same picture again a few times
+   at the normal pace. Hardware decoders hold back the last few frames they
+   were given until later ones push them out, which is invisible at 60 fps and
+   at 5 fps is most of a second of lag per change. The repeats encode to
+   almost nothing and are bounded to this many per real frame, so a motionless
+   screen still costs nothing. */
+#define PUSH_FRAMES 3
+static int g_push_left = 0;
+
 static long long now_us(void);
 /* Capture-side latency: grab → NV12 → handed to the encoder's FIFO.
    Reported as percentiles so the cost of the pipe-to-ffmpeg design can be
@@ -751,7 +760,11 @@ static void *writer_thread(void *arg) {
            transmit no new information. The occasional keepalive keeps the
            encoder and the client's read timeout alive. */
         long long now_ms_write = now_ms();
-        if (!fresh && (now_ms_write - g_last_write_ms) < IDLE_KEEPALIVE_MS)
+        if (fresh)
+            g_push_left = PUSH_FRAMES;
+        else if (g_push_left > 0)
+            g_push_left--;          /* a push repeat: send it */
+        else if ((now_ms_write - g_last_write_ms) < IDLE_KEEPALIVE_MS)
             continue;
         g_last_write_ms = now_ms_write;
 

@@ -14,25 +14,88 @@ use tracing::{info, warn};
 /// either falls back to.
 pub const CANDIDATES: [&str; 3] = ["h264_nvenc", "h264_vaapi", "libx264"];
 
-/// Extra ffmpeg arguments an encoder needs before it will accept a frame.
-fn setup_args(encoder: &str) -> Vec<&'static str> {
-    match encoder {
-        "h264_vaapi" | "hevc_vaapi" => vec![
-            "-vaapi_device",
-            "/dev/dri/renderD128",
-            "-vf",
-            "format=nv12,hwupload",
-        ],
-        _ => vec![],
+/// The render node VAAPI encodes on, once a probe has found one that works.
+static VAAPI_DEVICE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The render node to give ffmpeg's `-vaapi_device`: `USCREEN_VAAPI_DEVICE` if
+/// set, else the one a probe found working, else the old fixed guess. Both the
+/// test frame and the real encode use this, so they cannot disagree.
+pub fn vaapi_device() -> String {
+    std::env::var("USCREEN_VAAPI_DEVICE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| VAAPI_DEVICE.lock().ok().and_then(|g| g.clone()))
+        .unwrap_or_else(|| "/dev/dri/renderD128".to_string())
+}
+
+/// Render nodes worth trying for VAAPI, the GPUs that can run it first. The
+/// fixed `renderD128` is NVIDIA's on many machines (it is the first GPU
+/// registered, not the one with VAAPI), so a user who chose h264_vaapi had
+/// the test frame fail there and was switched back to NVENC.
+fn render_nodes() -> Vec<String> {
+    let mut nodes: Vec<(u8, String)> = Vec::new();
+    if let Ok(dir) = std::fs::read_dir("/dev/dri") {
+        for entry in dir.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("renderD") {
+                continue;
+            }
+            let driver = std::fs::read_link(format!("/sys/class/drm/{}/device/driver", name))
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                .unwrap_or_default();
+            let rank = match driver.as_str() {
+                "amdgpu" | "radeon" | "i915" | "xe" => 0,
+                "nvidia" | "nouveau" => 2,
+                _ => 1,
+            };
+            nodes.push((rank, format!("/dev/dri/{}", name)));
+        }
     }
+    nodes.sort();
+    nodes.into_iter().map(|(_, path)| path).collect()
 }
 
 /// Encode one 256x144 frame with `encoder`, bounded to a few seconds.
 /// The error is ffmpeg's own last line, which is what a bug report needs —
 /// "cannot encode" alone does not say whether the driver, the device node
 /// or the ffmpeg build is at fault.
+///
+/// VAAPI is tried on each render node in turn, and the one that works is
+/// remembered for the real encode.
 pub async fn probe(encoder: &str) -> Result<(), String> {
-    let mut args: Vec<&str> = vec![
+    if !encoder.contains("vaapi") {
+        return probe_on(encoder, None).await;
+    }
+    let mut nodes: Vec<String> = std::env::var("USCREEN_VAAPI_DEVICE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .into_iter()
+        .collect();
+    if nodes.is_empty() {
+        nodes = render_nodes();
+    }
+    if nodes.is_empty() {
+        nodes.push("/dev/dri/renderD128".to_string());
+    }
+    let mut errors = Vec::new();
+    for node in &nodes {
+        match probe_on(encoder, Some(node)).await {
+            Ok(()) => {
+                info!("VAAPI works on {}", node);
+                if let Ok(mut g) = VAAPI_DEVICE.lock() {
+                    *g = Some(node.clone());
+                }
+                return Ok(());
+            }
+            Err(e) => errors.push(format!("{}: {}", node, e)),
+        }
+    }
+    Err(errors.join("; "))
+}
+
+async fn probe_on(encoder: &str, vaapi_device: Option<&str>) -> Result<(), String> {
+    let mut args: Vec<String> = [
         "-hide_banner",
         "-loglevel",
         "error",
@@ -47,9 +110,25 @@ pub async fn probe(encoder: &str) -> Result<(), String> {
         "nv12",
         "-frames:v",
         "1",
-    ];
-    args.extend(setup_args(encoder));
-    args.extend(["-c:v", encoder, "-f", "null", "-"]);
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    if let Some(dev) = vaapi_device {
+        args.extend([
+            "-vaapi_device".to_string(),
+            dev.to_string(),
+            "-vf".to_string(),
+            "format=nv12,hwupload".to_string(),
+        ]);
+    }
+    args.extend([
+        "-c:v".to_string(),
+        encoder.to_string(),
+        "-f".to_string(),
+        "null".to_string(),
+        "-".to_string(),
+    ]);
     let run = tokio::process::Command::new("ffmpeg")
         .args(&args)
         .stdout(std::process::Stdio::null())

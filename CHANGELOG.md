@@ -3,6 +3,62 @@
 Full notes for each version are on the
 [releases page](https://github.com/majmichu1/UScreen/releases).
 
+## Unreleased
+
+- Choosing `h264_vaapi` no longer gets reset to `h264_nvenc`. The test frame
+  and the real encode both used `/dev/dri/renderD128`, which on many machines
+  belongs to the NVIDIA card; the test failed, and the daemon silently
+  replaced the encoder and saved that to the config. VAAPI is now tried on
+  each render node (AMD/Intel first) and the one that works is used for the
+  stream; `USCREEN_VAAPI_DEVICE` forces a node. A config that names any
+  encoder other than the stock `h264_nvenc` is never rewritten: a working
+  encoder is used for that run, with a warning, and `uscreen doctor` says why.
+- `position = "auto"` (globally or per tablet) turns placement off: the
+  daemon never moves, shifts or corrects the virtual screen and leaves
+  its position to the desktop, which now remembers each tablet separately.
+  The only thing it still does is switch the screen on if it is off.
+- Plugging in another tablet no longer makes the one already running
+  reconnect. A tablet missing from `adb devices` for a poll or two (which a
+  second tablet attaching can cause) was treated as unplugged, tearing its
+  pipeline down and even swapping the two tablets' roles; it now has to be
+  gone for several polls in a row. The `adb reverse` rules a USB reset
+  discards are restored, and a token request from one tablet no longer
+  relaunches the app on the others.
+- A tablet's `position` in its `[tablets.<serial>]` block now actually takes
+  effect (it was read but never used), and besides `left`, `right`, `above`
+  and `below` it accepts exact coordinates, `position = "2560,360"`, in
+  logical pixels from the top-left corner of the real screens. Works on KDE,
+  X11 and Hyprland; `uscreen doctor` shows each tablet's position.
+- Two tablets' virtual screens no longer land on top of each other. Their
+  EDIDs were identical (same fixed serial number), so KDE could not tell them
+  apart and gave both the same remembered position. Each tablet now has an
+  EDID serial derived from its adb serial. On KDE the daemon also notices a
+  virtual screen that is switched off, moved off its exact coordinates or
+  sitting on top of another screen, and puts it back.
+- Unplugging the first tablet no longer makes the second one reconnect. A
+  tablet already running as an extra is no longer picked up as the new first
+  tablet, which used to stop its pipeline, rebuild it, and run two pipelines
+  on it for a few seconds.
+- Streams no longer crawl when little is moving on screen. The encoder's
+  output has no frame boundaries, so each frame was held back until the next
+  one began, which on a quiet screen meant the idle keepalive (5 fps). A frame
+  is now sent as soon as the encoder goes briefly quiet, ffmpeg is told to flush
+  every packet, and each real change is followed by a few cheap repeats so the
+  tablet's decoder does not sit on the last frames.
+- On KDE the virtual display is switched back on if it gets turned off while
+  the tablet is connected. Plasma's display daemon can re-apply a saved layout
+  after the daemon has enabled the output, which left the screen listed in
+  System Settings but disabled; the daemon now checks every few seconds.
+- The virtual display is enabled reliably when several tablets start at once.
+  Their enable/disable steps now run one at a time (two worked from the same
+  snapshot of the layout and fought each other), the daemon waits up to ten
+  seconds for KWin to show the new output instead of three, and it checks the
+  output really is enabled afterwards, retrying if KWin accepted the request
+  and left it off.
+- Each tablet can be pinned to an EVDI device with `evdi = N` in its
+  `[tablets.<serial>]` block (N is the number in `evdi.N`; `uscreen doctor`
+  lists them). Tablets without one get the first free device, and never one
+  that another tablet has been promised.
 ## 1.2.9 — 2026-10-10
 
 - App: a still screen no longer makes the picture flash forever. After every

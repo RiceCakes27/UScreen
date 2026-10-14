@@ -53,7 +53,16 @@ pub struct TabletProfile {
     pub bitrate: Option<u32>,
     pub quality: Option<u32>,
     pub stream_scale: Option<u32>,
+    /// Where this tablet's screen goes: `right`, `left`, `above` or `below`
+    /// the other screens, or exact coordinates as `"X,Y"` (logical pixels,
+    /// from the top-left of the whole layout, e.g. `"2560,360"`). Unset means
+    /// the global `position`. `"auto"` means no placement at all: the
+    /// desktop decides.
     pub position: Option<String>,
+    /// Which EVDI device this tablet uses: the N of `evdi.N` under
+    /// /sys/devices/platform (`uscreen doctor` lists them). Unset means the
+    /// daemon picks the first free one.
+    pub evdi: Option<u32>,
 }
 
 impl TabletProfile {
@@ -175,16 +184,41 @@ pub enum Position {
     Left,
     Above,
     Below,
+    /// An exact place in the desktop layout, as "X,Y" in logical pixels from
+    /// the top-left corner of the real screens.
+    At(i64, i64),
+    /// No placement at all: the desktop decides where the screen goes (and
+    /// remembers it per monitor). Only a screen that is switched off is
+    /// switched on again.
+    Auto,
 }
 
 impl Position {
     pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
+        let s = s.trim().to_ascii_lowercase();
+        match s.as_str() {
             "right" => Some(Position::Right),
             "left" => Some(Position::Left),
             "above" | "top" => Some(Position::Above),
             "below" | "bottom" => Some(Position::Below),
-            _ => None,
+            "auto" | "system" | "none" => Some(Position::Auto),
+            _ => {
+                // "1920,0" or "1920, 0" or "-1920,360"
+                let (x, y) = s.split_once(',')?;
+                Some(Position::At(x.trim().parse().ok()?, y.trim().parse().ok()?))
+            }
+        }
+    }
+
+    /// For logs and `uscreen doctor`.
+    pub fn describe(&self) -> String {
+        match self {
+            Position::Right => "right of the other screens".into(),
+            Position::Left => "left of the other screens".into(),
+            Position::Above => "above the other screens".into(),
+            Position::Below => "below the other screens".into(),
+            Position::At(x, y) => format!("at ({}, {})", x, y),
+            Position::Auto => "left to the desktop to place".into(),
         }
     }
 
