@@ -35,6 +35,42 @@ pub fn evdi_cards() -> Vec<u32> {
     cards
 }
 
+/// Every EVDI device as (N of `evdi.N`, DRM card index), sorted by N. The
+/// first is what a user means by "EVDI number"; the second is what the helper
+/// is pinned with (`--card`) and what the logs call "card".
+pub fn evdi_devices() -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/sys/devices/platform") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(n) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("evdi."))
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(drm) = std::fs::read_dir(entry.path().join("drm")) else {
+            continue;
+        };
+        for card in drm.flatten() {
+            if let Some(idx) = card
+                .file_name()
+                .to_str()
+                .and_then(|n| n.strip_prefix("card"))
+                .and_then(|n| n.parse::<u32>().ok())
+            {
+                out.push((n, idx));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// A DRM connector belonging to an EVDI card, e.g. `DVI-I-1`.
 /// The name is exactly what KWin/kscreen-doctor calls the output.
 pub struct EvdiConnector {

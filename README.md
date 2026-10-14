@@ -1,7 +1,7 @@
 # UScreen for Linux — Android Tablet as a USB Second Monitor
 
 **UScreen is an open-source SuperDisplay alternative for Linux.** It turns an
-Android 8.1+ tablet into a real extended USB display and a pressure-sensitive
+Android 6.0+ tablet into a real extended USB display and a pressure-sensitive
 graphics tablet, with touch, S Pen pressure, tilt, eraser and stylus-button
 support.
 
@@ -77,7 +77,7 @@ help the next Linux user find it.
 | Fedora 44, KDE Plasma | Galaxy Tab S9 FE | works — "near perfectly", external report ([discussion #7](https://github.com/majmichu1/UScreen/discussions/7)) |
 | Debian 12 · Fedora 42 · openSUSE Tumbleweed | — | packages install and run (container-tested, no tablet) |
 
-Any Android 8.1+ tablet with a hardware H.264 decoder should work — the
+Any Android 6.0+ tablet with a hardware H.264 decoder should work — the
 display is generated to match the tablet. More in
 [docs/compatibility.md](docs/compatibility.md); reports are welcome.
 
@@ -130,7 +130,11 @@ Everything lives in `~/.config/uscreen/config.toml` and is reachable from
 - **Graphics tablet mode** — flip *Graphics tablet* on the tablet: nothing is
   streamed, the pen drives your own screen, zero display latency. Switch back
   the same way; no restart.
-- **Position** — `right` (default), `left`, `above`, `below` your real screens.
+- **Position** — `right` (default), `left`, `above`, `below` your real screens,
+  or exact coordinates as `"X,Y"` (logical pixels from the top-left corner of
+  your real screens, e.g. `"2560,360"`), or `auto` to place nothing and let
+  the desktop decide. Each tablet can have its own in its
+  `[tablets.<serial>]` block.
 - **Pen and mouse** — `pointer_handoff = false` (or the checkbox in the GUI)
   stops the pen from moving the desktop cursor: pen and touch drive the
   tablet's screen, the mouse stays where it was. On by default, which leaves

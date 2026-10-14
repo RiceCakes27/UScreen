@@ -18,7 +18,7 @@ android {
 
     defaultConfig {
         applicationId = "com.uscreen"
-        minSdk = 27
+        minSdk = 23
         targetSdk = 34
         versionCode = 20
         versionName = "1.2.11"
