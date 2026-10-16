@@ -15,7 +15,6 @@ Full notes for each version are on the
   code on random frames of several sizes and every pixel layout). It was the
   expensive way to lighten the load on a slow machine: per pixel about four
   times the cost of converting at full size.
-
 - VAAPI on a laptop with two GPUs: the daemon picks the first render node that
   really encodes a frame instead of always using `renderD128`, which is
   whichever driver loaded first — NVIDIA's when it won, and NVIDIA's VAAPI
