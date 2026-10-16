@@ -47,6 +47,16 @@ class Prefs(context: Context) {
      * which is what people drawing with a resting hand want (SuperDisplay has
      * the same switch). Applies at once and stays the tablet's own business.
      */
+    /**
+     * In graphics-tablet mode nothing is streamed, and the screen would show
+     * the same explanation for as long as the pen is in use — hours of static
+     * text on an OLED panel. On, the explanation stays for a few seconds and
+     * the screen then goes fully black; pen and touch keep working.
+     */
+    var blankPenOnly: Boolean
+        get() = sp.getBoolean("blank_pen_only", true)
+        set(v) = sp.edit().putBoolean("blank_pen_only", v).apply()
+
     var touchEnabled: Boolean
         get() = sp.getBoolean("touch_enabled", true)
         set(v) = sp.edit().putBoolean("touch_enabled", v).apply()

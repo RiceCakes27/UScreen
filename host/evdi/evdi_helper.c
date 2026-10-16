@@ -232,38 +232,112 @@ static inline int row_is_dirty(const unsigned char *mask, int cy) {
    source block, and each chroma sample the mean of the 2*scale square it
    covers. Box averaging rather than point sampling — dropping pixels would
    alias hard on desktop content, where single-pixel lines are everywhere. */
+/* Mean (b,g,r) of every output pixel of source rows [src_y0, src_y0 + n).
+
+   Two colour channels are summed per 32-bit add: a pixel is split into its
+   even bytes (v & 0x00FF00FF) and odd bytes ((v >> 8) & 0x00FF00FF), each
+   pair sitting in its own 16-bit lane, so a whole n x n block (n <= 4, at
+   most 16 x 255) is summed without a lane overflowing. Loading and
+   zero-extending single bytes one channel at a time was what made the scaled
+   path four times slower per pixel than the unscaled one. The block size is a
+   compile-time constant in the common cases, so the inner loop unrolls and
+   the division by n*n becomes a shift or a multiply. */
+typedef uint32_t __attribute__((may_alias)) u32a;
+#define SWAR_LANES 0x00FF00FFu
+
+#define SWAR_ROWS(N)                                                           \
+    for (int dy = 0; dy < (N); dy++) {                                         \
+        const u32a *row = (const u32a *)(src + (size_t)(src_y0 + dy) * stride);\
+        for (int ox = 0; ox < ow; ox++) {                                      \
+            const u32a *px = row + (size_t)ox * (N);                           \
+            uint32_t se = 0, so = 0;                                           \
+            for (int dx = 0; dx < (N); dx++) {                                 \
+                uint32_t v = px[dx];                                           \
+                se += v & SWAR_LANES;                                          \
+                so += (v >> 8) & SWAR_LANES;                                   \
+            }                                                                  \
+            e[ox] += se; o[ox] += so;                                          \
+        }                                                                      \
+    }
+
+static inline int swar_channel(uint32_t e, uint32_t o, int byte) {
+    uint32_t w = (byte & 1) ? o : e;
+    return (int)((w >> ((byte >> 1) * 16)) & 0xFFFF);
+}
+
+#define MEAN_MAX_OW 4096
+static inline void scaled_row_means(const unsigned char *src, int stride, int ow,
+                                    int n, int src_y0, int ob, int og, int or_,
+                                    int *acc) {
+    uint32_t e[MEAN_MAX_OW], o[MEAN_MAX_OW];
+    memset(e, 0, (size_t)ow * sizeof(uint32_t));
+    memset(o, 0, (size_t)ow * sizeof(uint32_t));
+    switch (n) {
+    case 2: SWAR_ROWS(2) break;
+    case 3: SWAR_ROWS(3) break;
+    case 4: SWAR_ROWS(4) break;
+    default: SWAR_ROWS(n) break;
+    }
+    const int inv = n * n;
+    switch (n) {
+    case 2:
+        for (int ox = 0; ox < ow; ox++) {
+            acc[ox*3]   = swar_channel(e[ox], o[ox], ob) / 4;
+            acc[ox*3+1] = swar_channel(e[ox], o[ox], og) / 4;
+            acc[ox*3+2] = swar_channel(e[ox], o[ox], or_) / 4;
+        }
+        break;
+    case 3:
+        for (int ox = 0; ox < ow; ox++) {
+            acc[ox*3]   = swar_channel(e[ox], o[ox], ob) / 9;
+            acc[ox*3+1] = swar_channel(e[ox], o[ox], og) / 9;
+            acc[ox*3+2] = swar_channel(e[ox], o[ox], or_) / 9;
+        }
+        break;
+    case 4:
+        for (int ox = 0; ox < ow; ox++) {
+            acc[ox*3]   = swar_channel(e[ox], o[ox], ob) / 16;
+            acc[ox*3+1] = swar_channel(e[ox], o[ox], og) / 16;
+            acc[ox*3+2] = swar_channel(e[ox], o[ox], or_) / 16;
+        }
+        break;
+    default:
+        for (int ox = 0; ox < ow; ox++) {
+            acc[ox*3]   = swar_channel(e[ox], o[ox], ob) / inv;
+            acc[ox*3+1] = swar_channel(e[ox], o[ox], og) / inv;
+            acc[ox*3+2] = swar_channel(e[ox], o[ox], or_) / inv;
+        }
+    }
+}
+
+/* Per-thread scratch for two output rows of means: 3 channels x up to 4096
+   output pixels (8192 wide at scale 2). */
+static __thread int t_mean0[MEAN_MAX_OW * 3];
+static __thread int t_mean1[MEAN_MAX_OW * 3];
+
 static inline void convert_strip_scaled(const conv_job_t *j) {
     const int n = j->scale, stride = j->stride, ow = j->ow;
-    const int inv = n * n;
     const int or_ = g_off_r, og = g_off_g, ob = g_off_b;
+    if (ow > MEAN_MAX_OW) return;           /* mode checks keep it below this */
     for (int cy = j->cy0; cy < j->cy1; cy++) {
         if (!row_is_dirty(j->dirty, cy))
             continue;
         unsigned char *yo0 = j->ydst + (size_t)(cy * 2) * ow;
         unsigned char *yo1 = yo0 + ow;
         unsigned char *uv  = j->uvdst + (size_t)cy * ow;
+        /* The two output luma rows this chroma row covers. */
+        scaled_row_means(j->src, stride, ow, n, (cy * 2) * n, ob, og, or_, t_mean0);
+        scaled_row_means(j->src, stride, ow, n, (cy * 2 + 1) * n, ob, og, or_, t_mean1);
         for (int ox = 0; ox < ow; ox += 2) {
-            int csb = 0, csg = 0, csr = 0;      /* chroma: whole 2n x 2n block */
-            for (int q = 0; q < 4; q++) {       /* four output luma pixels */
-                int oxx = ox + (q & 1);
-                int oyy = cy * 2 + (q >> 1);
-                int sb = 0, sg = 0, sr = 0;
-                for (int dy = 0; dy < n; dy++) {
-                    const unsigned char *row =
-                        j->src + (size_t)(oyy * n + dy) * stride + (size_t)(oxx * n) * 4;
-                    for (int dx = 0; dx < n; dx++) {
-                        sb += row[dx * 4 + ob];
-                        sg += row[dx * 4 + og];
-                        sr += row[dx * 4 + or_];
-                    }
-                }
-                int b = sb / inv, g = sg / inv, r = sr / inv;
-                unsigned char yv =
-                    (unsigned char)(((47 * r + 157 * g + 16 * b + 128) >> 8) + 16);
-                if (q < 2) yo0[oxx] = yv; else yo1[oxx] = yv;
-                csb += b; csg += g; csr += r;
-            }
-            int ab = csb >> 2, ag = csg >> 2, ar = csr >> 2;
+            const int *m00 = t_mean0 + ox * 3, *m01 = t_mean0 + (ox + 1) * 3;
+            const int *m10 = t_mean1 + ox * 3, *m11 = t_mean1 + (ox + 1) * 3;
+            yo0[ox]     = (unsigned char)(((47 * m00[2] + 157 * m00[1] + 16 * m00[0] + 128) >> 8) + 16);
+            yo0[ox + 1] = (unsigned char)(((47 * m01[2] + 157 * m01[1] + 16 * m01[0] + 128) >> 8) + 16);
+            yo1[ox]     = (unsigned char)(((47 * m10[2] + 157 * m10[1] + 16 * m10[0] + 128) >> 8) + 16);
+            yo1[ox + 1] = (unsigned char)(((47 * m11[2] + 157 * m11[1] + 16 * m11[0] + 128) >> 8) + 16);
+            int ab = (m00[0] + m01[0] + m10[0] + m11[0]) >> 2;
+            int ag = (m00[1] + m01[1] + m10[1] + m11[1]) >> 2;
+            int ar = (m00[2] + m01[2] + m10[2] + m11[2]) >> 2;
             int cb = (((-25 * ar - 87 * ag + 112 * ab + 128) >> 8) + 128);
             int cr = (((112 * ar - 102 * ag - 10 * ab + 128) >> 8) + 128);
             if (cb < 0) cb = 0; else if (cb > 255) cb = 255;

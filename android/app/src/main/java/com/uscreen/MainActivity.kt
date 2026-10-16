@@ -411,6 +411,7 @@ fun UScreenMain(
     var showSettings by remember { mutableStateOf(false) }
     var showStats by remember { mutableStateOf(prefs?.showStats ?: false) }
     var touchOn by remember { mutableStateOf(prefs?.touchEnabled ?: true) }
+    var blankInPenMode by remember { mutableStateOf(prefs?.blankPenOnly ?: true) }
     var orientationChoice by remember { mutableStateOf(prefs?.orientation ?: Prefs.ORIENTATION_AUTO) }
 
     val context = LocalContext.current
@@ -481,7 +482,7 @@ fun UScreenMain(
             exit = fadeOut(),
             modifier = Modifier.fillMaxSize()
         ) {
-            PenOnlyScreen()
+            PenOnlyScreen(blankAfterSeconds = if (blankInPenMode) 8 else 0)
         }
 
         // Connection screen
@@ -519,7 +520,9 @@ fun UScreenMain(
                 .align(Alignment.TopEnd)
                 .padding(10.dp)
                 .size(38.dp)
-                .alpha(if (isConnected) 0.35f else 0.9f)
+                // Dimmer still while the screen is blanked: it is the one thing
+                // left lit on an OLED panel.
+                .alpha(if (penOnly && blankInPenMode) 0.18f else if (isConnected) 0.35f else 0.9f)
                 .clip(CircleShape)
                 .background(Color(0xAA20202C))
                 .clickable { showSettings = true },
@@ -609,6 +612,11 @@ fun UScreenMain(
                     showStats = it
                     prefs?.showStats = it
                 },
+                blankPenOnly = blankInPenMode,
+                onBlankPenOnlyChange = {
+                    blankInPenMode = it
+                    prefs?.blankPenOnly = it
+                },
                 touchEnabled = touchOn,
                 onTouchEnabledChange = {
                     touchOn = it
@@ -634,7 +642,22 @@ fun UScreenMain(
 }
 
 @Composable
-private fun PenOnlyScreen() {
+private fun PenOnlyScreen(blankAfterSeconds: Int) {
+    // After the explanation has been read the screen goes fully black: on an
+    // OLED panel black pixels are off, and the explanation would otherwise sit
+    // on screen for as long as the pen is in use.
+    var blank by remember { mutableStateOf(false) }
+    LaunchedEffect(blankAfterSeconds) {
+        blank = false
+        if (blankAfterSeconds > 0) {
+            kotlinx.coroutines.delay(blankAfterSeconds * 1000L)
+            blank = true
+        }
+    }
+    if (blank) {
+        Box(modifier = Modifier.fillMaxSize().background(Color.Black))
+        return
+    }
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -660,6 +683,14 @@ private fun PenOnlyScreen() {
                 fontSize = 13.sp, lineHeight = 22.sp, color = Color(0xFF9A9AAE),
                 textAlign = TextAlign.Center
             )
+            if (blankAfterSeconds > 0) {
+                Spacer(Modifier.height(18.dp))
+                Text(
+                    "The screen goes black in a few seconds to spare OLED panels. " +
+                        "Settings are behind the faint ⚙ in the corner.",
+                    fontSize = 12.sp, color = Color(0xFF6A6A7E), textAlign = TextAlign.Center
+                )
+            }
         }
     }
 }
@@ -735,6 +766,8 @@ private fun SettingsSheet(
     onPenOnlyChange: (Boolean) -> Unit,
     showStats: Boolean,
     onShowStatsChange: (Boolean) -> Unit,
+    blankPenOnly: Boolean,
+    onBlankPenOnlyChange: (Boolean) -> Unit,
     touchEnabled: Boolean,
     onTouchEnabledChange: (Boolean) -> Unit,
     orientation: Int,
@@ -924,6 +957,29 @@ private fun SettingsSheet(
                 Switch(
                     checked = showStats,
                     onCheckedChange = onShowStatsChange,
+                    colors = SwitchDefaults.colors(checkedTrackColor = Accent)
+                )
+            }
+            Spacer(Modifier.height(20.dp))
+
+            // OLED care for graphics-tablet mode. Applies at once.
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Black screen in graphics tablet mode", fontSize = 14.sp, color = Color(0xFFB0B0C0))
+                    Text(
+                        "Nothing is streamed there, so the screen goes black a few seconds after " +
+                            "it starts instead of showing the same text for hours",
+                        fontSize = 11.sp,
+                        color = Color(0xFF6A6A7E)
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Switch(
+                    checked = blankPenOnly,
+                    onCheckedChange = onBlankPenOnlyChange,
                     colors = SwitchDefaults.colors(checkedTrackColor = Accent)
                 )
             }

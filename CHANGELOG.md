@@ -3,6 +3,19 @@
 Full notes for each version are on the
 [releases page](https://github.com/majmichu1/UScreen/releases).
 
+## Unreleased
+
+- Graphics-tablet mode no longer leaves the same text on an OLED screen for
+  hours. The explanation is shown for eight seconds and the screen then goes
+  fully black — pen and touch keep working — with a new switch, *Black screen
+  in graphics tablet mode*, in the app's ⚙ to turn that off
+  ([#32](https://github.com/majmichu1/UScreen/discussions/32)).
+- The capture helper's downscaling path (`stream_scale` 2 to 4) is 1.3 to 1.8
+  times faster, with byte-for-byte the same output (checked against the old
+  code on random frames of several sizes and every pixel layout). It was the
+  expensive way to lighten the load on a slow machine: per pixel about four
+  times the cost of converting at full size.
+
 ## 1.2.9 — 2026-10-10
 
 - App: a still screen no longer makes the picture flash forever. After every
