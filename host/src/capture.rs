@@ -808,7 +808,7 @@ impl CaptureManager {
         if encoder == "h264_vaapi" {
             encoder_args.extend_from_slice(&[
                 "-vaapi_device".into(),
-                "/dev/dri/renderD128".into(),
+                crate::encoders::vaapi_device(),
             ]);
         }
 

@@ -14,14 +14,75 @@ use tracing::{info, warn};
 /// either falls back to.
 pub const CANDIDATES: [&str; 3] = ["h264_nvenc", "h264_vaapi", "libx264"];
 
+const DEFAULT_VAAPI_DEVICE: &str = "/dev/dri/renderD128";
+static VAAPI_DEVICE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static VAAPI_PICKED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+/// The render node VAAPI encodes on: the configured or auto-picked one once
+/// `ensure_vaapi_device` has run, `renderD128` before that.
+pub fn vaapi_device() -> String {
+    VAAPI_DEVICE.get().cloned().unwrap_or_else(|| DEFAULT_VAAPI_DEVICE.to_string())
+}
+
+/// The nodes worth trying for VAAPI, from `(number, driver)` pairs, in node
+/// order. NVIDIA's proprietary driver is left out: its VA-API backend only
+/// decodes, so on a hybrid laptop where it owns `renderD128` the Intel or AMD
+/// node after it is the one that can encode.
+fn order_nodes(mut found: Vec<(u32, String)>) -> Vec<String> {
+    found.retain(|(_, driver)| driver != "nvidia");
+    found.sort();
+    found.into_iter().map(|(n, _)| format!("/dev/dri/renderD{}", n)).collect()
+}
+
+fn render_nodes() -> Vec<String> {
+    let Ok(dir) = std::fs::read_dir("/sys/class/drm") else { return Vec::new() };
+    let found = dir
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let num = name.strip_prefix("renderD")?.parse::<u32>().ok()?;
+            let driver = std::fs::read_link(e.path().join("device/driver"))
+                .ok()
+                .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+                .unwrap_or_default();
+            Some((num, driver))
+        })
+        .collect();
+    order_nodes(found)
+}
+
+/// Settle which render node VAAPI uses, once per run: `configured` when it is
+/// set, otherwise the first node that encodes a test frame. Falls back to the
+/// old default when none does, so the failure still reads the way it used to.
+pub async fn ensure_vaapi_device(configured: &str) {
+    VAAPI_PICKED
+        .get_or_init(|| async {
+            if !configured.is_empty() {
+                info!("VAAPI device: {} (from the config)", configured);
+                let _ = VAAPI_DEVICE.set(configured.to_string());
+                return;
+            }
+            for node in render_nodes() {
+                if probe_with("h264_vaapi", Some(&node)).await.is_ok() {
+                    if node != DEFAULT_VAAPI_DEVICE {
+                        info!("VAAPI device: {} ({} cannot encode here)", node, DEFAULT_VAAPI_DEVICE);
+                    }
+                    let _ = VAAPI_DEVICE.set(node);
+                    return;
+                }
+            }
+        })
+        .await;
+}
+
 /// Extra ffmpeg arguments an encoder needs before it will accept a frame.
-fn setup_args(encoder: &str) -> Vec<&'static str> {
+fn setup_args(encoder: &str, vaapi_device: &str) -> Vec<String> {
     match encoder {
         "h264_vaapi" | "hevc_vaapi" => vec![
-            "-vaapi_device",
-            "/dev/dri/renderD128",
-            "-vf",
-            "format=nv12,hwupload",
+            "-vaapi_device".into(),
+            vaapi_device.into(),
+            "-vf".into(),
+            "format=nv12,hwupload".into(),
         ],
         _ => vec![],
     }
@@ -32,7 +93,16 @@ fn setup_args(encoder: &str) -> Vec<&'static str> {
 /// "cannot encode" alone does not say whether the driver, the device node
 /// or the ffmpeg build is at fault.
 pub async fn probe(encoder: &str) -> Result<(), String> {
-    let mut args: Vec<&str> = vec![
+    if encoder.contains("vaapi") {
+        ensure_vaapi_device(&crate::config::FileConfig::load().vaapi_device).await;
+    }
+    probe_with(encoder, None).await
+}
+
+/// `probe`, on a given VAAPI render node (`None` = the settled one).
+async fn probe_with(encoder: &str, vaapi_device_override: Option<&str>) -> Result<(), String> {
+    let device = vaapi_device_override.map(str::to_string).unwrap_or_else(vaapi_device);
+    let mut args: Vec<String> = [
         "-hide_banner",
         "-loglevel",
         "error",
@@ -47,9 +117,12 @@ pub async fn probe(encoder: &str) -> Result<(), String> {
         "nv12",
         "-frames:v",
         "1",
-    ];
-    args.extend(setup_args(encoder));
-    args.extend(["-c:v", encoder, "-f", "null", "-"]);
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    args.extend(setup_args(encoder, &device));
+    args.extend(["-c:v", encoder, "-f", "null", "-"].map(String::from));
     let run = tokio::process::Command::new("ffmpeg")
         .args(&args)
         .stdout(std::process::Stdio::null())
@@ -122,5 +195,29 @@ pub async fn resolve(configured: &str) -> Option<String> {
             info!("No H.264 encoder works here: tried {}", CANDIDATES.join(", "));
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skips_nvidia_and_keeps_node_order() {
+        let found = vec![
+            (129, "i915".to_string()),
+            (128, "nvidia".to_string()),
+            (130, "amdgpu".to_string()),
+        ];
+        assert_eq!(order_nodes(found), ["/dev/dri/renderD129", "/dev/dri/renderD130"]);
+        assert!(order_nodes(vec![(128, "nvidia".into())]).is_empty());
+    }
+
+    #[test]
+    fn vaapi_setup_names_the_chosen_render_node() {
+        let a = setup_args("h264_vaapi", "/dev/dri/renderD129");
+        assert_eq!(a[0], "-vaapi_device");
+        assert_eq!(a[1], "/dev/dri/renderD129");
+        assert!(setup_args("h264_nvenc", "/dev/dri/renderD129").is_empty());
     }
 }

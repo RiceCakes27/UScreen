@@ -219,6 +219,11 @@ async fn run_daemon(cli: Cli) -> Result<()> {
             ),
         },
     };
+    // Settle the VAAPI render node now, also for an encoder given on the
+    // command line, which skips the probe that would otherwise do it.
+    if encoder.contains("vaapi") {
+        encoders::ensure_vaapi_device(&file_cfg.vaapi_device).await;
+    }
     let fps = cli.fps.unwrap_or(file_cfg.fps);
     let bitrate = cli.bitrate.unwrap_or(file_cfg.bitrate);
     let width = cli.width.unwrap_or(file_cfg.width);

@@ -143,6 +143,14 @@ Everything lives in `~/.config/uscreen/config.toml` and is reachable from
   8-bit, so it adds precision, not colour; it is not HDR.
 - **Stream scale** — `stream_scale = 2` sends a quarter of the pixels for a
   ~6 ms lower decode time at the cost of softer text.
+- **VAAPI on a laptop with two GPUs** — the daemon picks the first render node
+  that really encodes a frame (NVIDIA's cannot, through VAAPI); to choose
+  yourself set `vaapi_device = "/dev/dri/renderD129"`. `uscreen doctor` says
+  which node is in use.
+- **Black screen in graphics tablet mode** — on by default, in the tablet's ⚙:
+  the explanation shows for eight seconds, then the screen goes fully black
+  so an OLED panel is not left lit with the same text. Pen and touch still
+  work. **Touch input** (same sheet) turns fingers off and leaves the pen.
 - **Several tablets** — `max_tablets` up to 4, each its own screen. Each is
   remembered by its serial in a `[tablets.<serial>]` block: its panel size, so
   the right display is built the moment it is plugged in, and optionally its

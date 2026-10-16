@@ -121,6 +121,12 @@ pub struct FileConfig {
     /// reconnect to it by itself, so the tablet comes back as a screen
     /// without anyone typing an adb command. Empty disables that.
     pub wifi_address: String,
+    /// The DRM render node VAAPI encodes on, e.g. `/dev/dri/renderD129`.
+    /// Empty picks the first node that really encodes a frame: on a laptop
+    /// with two GPUs `renderD128` is whichever driver loaded first, and when
+    /// that is NVIDIA's (which cannot encode through VAAPI) a perfectly good
+    /// Intel or AMD encoder next to it went unused.
+    pub vaapi_device: String,
     /// Remembered per tablet, keyed by adb serial. Written when a tablet
     /// reports its panel, read the next time that tablet is plugged in.
     pub tablets: std::collections::HashMap<String, TabletProfile>,
@@ -158,6 +164,7 @@ impl Default for FileConfig {
             check_updates: true,
             max_tablets: 1,
             wifi_address: String::new(),
+            vaapi_device: String::new(),
             tablets: std::collections::HashMap::new(),
             pointer_handoff: true,
             auto_resolution: true,

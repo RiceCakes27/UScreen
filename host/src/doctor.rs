@@ -187,6 +187,9 @@ async fn check_tools(r: &mut Report, cfg: &FileConfig) {
                 "configured encoder",
                 &format!("{} encodes a test frame", cfg.encoder),
             );
+            if cfg.encoder.contains("vaapi") {
+                r.line(Level::Ok, "VAAPI device", &crate::encoders::vaapi_device());
+            }
         }
     }
 }

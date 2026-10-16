@@ -16,6 +16,13 @@ Full notes for each version are on the
   expensive way to lighten the load on a slow machine: per pixel about four
   times the cost of converting at full size.
 
+- VAAPI on a laptop with two GPUs: the daemon picks the first render node that
+  really encodes a frame instead of always using `renderD128`, which is
+  whichever driver loaded first — NVIDIA's when it won, and NVIDIA's VAAPI
+  cannot encode, so Intel or AMD next to it went unused and the encoder fell
+  back to the CPU. `vaapi_device` in the config chooses a node by hand, and
+  `uscreen doctor` shows the one in use.
+
 ## 1.2.9 — 2026-10-10
 
 - App: a still screen no longer makes the picture flash forever. After every
