@@ -38,6 +38,30 @@ rest see it as a tablet.
 It extends. There is also a "graphics tablet" mode in which nothing is
 streamed and the pen simply drives your existing screen, like a Wacom Intuos.
 
+**Light pen taps are missed — can I fix that?**
+On some tablets (reported with a Xiaomi Pad 7 and Focus Pen Pro) a very light
+tap arrives with no pressure at all, and libinput, which decides when the tip
+is down from the pressure, drops it. UScreen now never reports less than the
+smallest pressure while the pen touches (1.2.10). libinput's own threshold for
+a tip-down is higher than that, though, so the reporter also lowered it with a
+libinput quirk, which made light taps register reliably. It is not installed
+automatically, because a quirk file is read by every program that uses
+libinput and a mistake in one is not something an app should risk for you.
+To try it, add this and log out and in again:
+
+```bash
+sudo mkdir -p /etc/libinput
+sudo tee -a /etc/libinput/local-overrides.quirks <<'EOF'
+[UScreen virtual pen contact]
+MatchName=UScreen Pen*
+MatchUdevType=tablet
+AttrPressureRange=1:0
+EOF
+```
+
+It has been confirmed on one setup; tell me how it goes on yours. To undo it,
+delete those four lines.
+
 **Does UScreen work on Bazzite and KDE Wayland?**
 That is the reference setup. KDE on Wayland gets automatic output placement,
 input mapping and on-screen-keyboard suppression. Since 1.2.7 Hyprland gets

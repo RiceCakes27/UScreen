@@ -107,6 +107,8 @@ impl DeviceIdentity {
 /// ~310mm wide active area → 65535/310 ≈ 211 units/mm.
 /// libinput requires a resolution on touchscreen/tablet axes.
 const RESOLUTION_UNITS_PER_MM: i32 = 211;
+/// The virtual pen's pressure axis runs 0..=PEN_PRESSURE_MAX.
+const PEN_PRESSURE_MAX: i32 = 4096;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -333,7 +335,7 @@ impl UInputDevice {
 
             Self::abs_setup(fd, ABS_X, 0, w - 1, RESOLUTION_UNITS_PER_MM)?;
             Self::abs_setup(fd, ABS_Y, 0, h - 1, RESOLUTION_UNITS_PER_MM)?;
-            Self::abs_setup(fd, ABS_PRESSURE, 0, 4096, 0)?;
+            Self::abs_setup(fd, ABS_PRESSURE, 0, PEN_PRESSURE_MAX, 0)?;
             // Tilt in whole degrees
             Self::abs_setup(fd, ABS_TILT_X, -90, 90, 0)?;
             Self::abs_setup(fd, ABS_TILT_Y, -90, 90, 0)?;
@@ -513,6 +515,13 @@ impl UInputDevice {
         // The active tablet-tool key depends on which end of the pen is in
         // use. An S Pen flipped to its eraser end reports TOOL_TYPE_ERASER.
         let tool = if eraser { BTN_TOOL_RUBBER } else { BTN_TOOL_PEN };
+        // A pen that is touching reports some pressure. A very light tap can
+        // arrive from the tablet as exactly 0 (a Xiaomi Focus Pen Pro does),
+        // which says "touching" with BTN_TOUCH and "not touching" with the
+        // pressure, and libinput, which decides tip-down from pressure when
+        // the device has a pressure axis, then drops the tap. Hover and the
+        // lift keep sending 0.
+        let contact_pressure = pressure.clamp(1, PEN_PRESSURE_MAX);
         match action {
             0 => {
                 // DOWN, in two frames.
@@ -530,7 +539,7 @@ impl UInputDevice {
                 self.syn()?;
 
                 self.emit(EV_KEY, BTN_TOUCH, 1)?;
-                self.emit(EV_ABS, ABS_PRESSURE, pressure)?;
+                self.emit(EV_ABS, ABS_PRESSURE, contact_pressure)?;
                 self.syn()?;
             }
             1 => {
@@ -556,7 +565,7 @@ impl UInputDevice {
                 // MOVE (pressing)
                 self.emit(EV_ABS, ABS_X, x)?;
                 self.emit(EV_ABS, ABS_Y, y)?;
-                self.emit(EV_ABS, ABS_PRESSURE, pressure)?;
+                self.emit(EV_ABS, ABS_PRESSURE, contact_pressure)?;
                 self.emit(EV_ABS, ABS_TILT_X, tilt_x)?;
                 self.emit(EV_ABS, ABS_TILT_Y, tilt_y)?;
                 self.syn()?;
@@ -1681,6 +1690,26 @@ mod tests {
             "the tool must still be in proximity while the last sample goes out"
         );
         assert_eq!(f[4], vec![(EV_KEY, BTN_TOOL_PEN, 0)], "proximity out in its own frame");
+    }
+
+    #[test]
+    fn a_touching_pen_never_reports_zero_pressure() {
+        let (mut dev, path) = device_over_file("lightpress");
+        dev.inject_pen(100, 200, 0, 0, 0, 0, false).unwrap(); // light tap down, pressure 0
+        dev.inject_pen(101, 201, 0, 0, 0, 2, false).unwrap(); // contact move, pressure 0
+        dev.inject_pen(102, 202, 9000, 0, 0, 2, false).unwrap(); // above the axis maximum
+        dev.inject_pen(103, 203, 0, 0, 0, 3, false).unwrap(); // hover
+        dev.inject_pen(103, 203, 0, 0, 0, 1, false).unwrap(); // lift
+        let f = frames(&path);
+        let _ = std::fs::remove_file(&path);
+        let pressure = |frame: &Vec<(u16, u16, i32)>| {
+            frame.iter().find(|e| e.0 == EV_ABS && e.1 == ABS_PRESSURE).map(|e| e.2)
+        };
+        assert_eq!(pressure(&f[1]), Some(1), "tip-down frame");
+        assert_eq!(pressure(&f[2]), Some(1), "contact move");
+        assert_eq!(pressure(&f[3]), Some(PEN_PRESSURE_MAX), "clamped to the axis range");
+        assert_eq!(pressure(&f[4]), Some(0), "hover stays at zero");
+        assert_eq!(pressure(&f[5]), Some(0), "the lift stays at zero");
     }
 
     #[test]

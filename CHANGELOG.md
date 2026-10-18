@@ -3,8 +3,18 @@
 Full notes for each version are on the
 [releases page](https://github.com/majmichu1/UScreen/releases).
 
-## Unreleased
+## 1.2.10 — 2026-10-18
 
+- Pen: a touching pen never reports zero pressure. A very light tap can come
+  from the tablet as exactly 0 (a Xiaomi Focus Pen Pro does), which says
+  "touching" with the button and "not touching" with the pressure, and libinput
+  then drops the tap. The pressure while the pen is down is now at least 1,
+  hover and lift still send 0. This alone is not always enough — libinput's
+  tip-down threshold is higher — so [docs/faq.md](docs/faq.md) has the
+  libinput quirk that completed the fix for the reporter, to be added by hand
+  for now ([#34](https://github.com/majmichu1/UScreen/issues/34)). The
+  automatic install of that quirk is planned, after it has been checked
+  against a live device.
 - Graphics-tablet mode no longer leaves the same text on an OLED screen for
   hours. The explanation is shown for eight seconds and the screen then goes
   fully black — pen and touch keep working — with a new switch, *Black screen
