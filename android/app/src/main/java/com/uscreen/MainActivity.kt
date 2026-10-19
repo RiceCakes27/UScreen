@@ -69,6 +69,15 @@ class MainActivity : ComponentActivity() {
             }
         }
         videoReceiver?.streamFps = prefs.fps
+        // The computer's own fps and bitrate, sent on connect and whenever they
+        // change there. The settings sheet shows these, and nothing is sent
+        // back until the user presses Apply: the tablet used to re-send its
+        // remembered copy on every connect and overwrite config.toml (#37).
+        touchCapture?.onSettingsKnown = { fps, kbps ->
+            prefs.fps = fps
+            prefs.bitrateKbps = kbps
+            videoReceiver?.streamFps = fps
+        }
         touchCapture?.onCodecKnown = { codec ->
             val mime = if (codec == "hevc") VideoReceiver.MIME_TYPE_HEVC
                        else VideoReceiver.MIME_TYPE
@@ -349,12 +358,6 @@ class MainActivity : ComponentActivity() {
         // sending a display. In pen-only mode there is nothing to receive and
         // spinning up a decoder would waste power for no picture.
         touchCapture?.connect()
-        // Only re-assert settings the user actually chose here. Pushing the
-        // tablet's defaults on every start would silently overwrite whatever
-        // was configured in the desktop GUI.
-        if (prefs.hasUserSettings) {
-            touchCapture?.sendConfig(prefs.bitrateKbps, prefs.fps)
-        }
     }
 
     override fun onStop() {
@@ -631,8 +634,7 @@ fun UScreenMain(
                 onApply = { bitrateKbps, newFps ->
                     prefs?.bitrateKbps = bitrateKbps
                     prefs?.fps = newFps
-                    // From now on the tablet re-asserts these on every connect.
-                    prefs?.hasUserSettings = true
+                    // The one moment the tablet speaks: the user chose these.
                     touchCapture?.sendConfig(bitrateKbps, newFps)
                 },
                 onDismiss = { showSettings = false }

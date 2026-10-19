@@ -74,18 +74,6 @@ class Prefs(context: Context) {
         set(v) = sp.edit().putInt("orientation", v).apply()
 
     /**
-     * True once the user has actually applied settings from the sheet.
-     *
-     * Until then the tablet stays silent instead of pushing its defaults on
-     * every connect: the desktop GUI is the source of truth, and a tablet that
-     * announces stale defaults at startup silently undoes whatever was set
-     * there. Only a deliberate "Apply" gives the tablet the right to speak.
-     */
-    var hasUserSettings: Boolean
-        get() = sp.getBoolean("has_user_settings", false)
-        set(v) = sp.edit().putBoolean("has_user_settings", v).apply()
-
-    /**
      * The daemon's session token, delivered as an intent extra when it
      * launches the app over adb. Kept so a relaunch by hand within the same
      * daemon run still authenticates; a new daemon run hands out a new one.

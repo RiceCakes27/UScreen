@@ -33,6 +33,8 @@ class TouchCapture {
         private set
     var onModeKnown: ((penOnly: Boolean) -> Unit)? = null
     var onCodecKnown: ((codec: String) -> Unit)? = null
+    /** The computer's fps and bitrate, on connect and whenever they change there. */
+    var onSettingsKnown: ((fps: Int, bitrateKbps: Int) -> Unit)? = null
 
     /// Session token from the host, delivered as an intent extra when the
     /// daemon launches us over adb. Must be the first thing sent on the
@@ -108,6 +110,9 @@ class TouchCapture {
                 val o = JSONObject(text)
                 if (o.has("codec")) {
                     onCodecKnown?.invoke(o.getString("codec"))
+                }
+                if (o.has("fps") && o.has("bitrate_kbps")) {
+                    onSettingsKnown?.invoke(o.getInt("fps"), o.getInt("bitrate_kbps"))
                 }
                 if (o.has("pen_only")) {
                     val pen = o.getBoolean("pen_only")

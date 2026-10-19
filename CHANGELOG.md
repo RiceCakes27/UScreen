@@ -3,6 +3,21 @@
 Full notes for each version are on the
 [releases page](https://github.com/majmichu1/UScreen/releases).
 
+## Unreleased
+
+- The tablet app no longer overwrites `fps` and `bitrate` in `config.toml` every
+  time it connects. Once you had pressed Apply in the app's ⚙, the app
+  remembered "the user chose these" and re-sent its own copy on every
+  connect, and the daemon wrote it into the config — undoing a value set in
+  the file or the GUI ([#37](https://github.com/majmichu1/UScreen/issues/37)).
+  Now the daemon tells the app its current fps and bitrate when it connects,
+  and again whenever they change on the computer; the settings sheet shows
+  those, and the app sends settings only when you press Apply. Needs the
+  computer side and the app updated together: a new daemon with an old app
+  still gets overwritten, and a new app with an old daemon keeps its own
+  numbers. The daemon half was tested against a simulated app (greeting,
+  Apply, no echo loop); the app half was compiled but not run on a tablet.
+
 ## 1.2.10 — 2026-10-18
 
 - Pen: a touching pen never reports zero pressure. A very light tap can come

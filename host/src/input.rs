@@ -217,6 +217,15 @@ pub struct InputResponse {
     /// Tells the tablet not to expect a video stream: it is acting as a
     /// graphics tablet for the host's own screen, not as a display.
     pub pen_only: bool,
+    /// The computer's current stream settings. The tablet shows these and
+    /// sends settings back only when the user presses Apply; until it knew
+    /// them it re-sent its own remembered copy on every connect, which
+    /// overwrote whatever was set in `config.toml` or the GUI (#37). Absent
+    /// from a daemon that does not know about them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitrate_kbps: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -1300,6 +1309,15 @@ async fn handle_connection(
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let mut mode_rx = mode_tx.subscribe();
+    // The stream settings as they are now, and a way to hear when they change.
+    let mut settings_rx = settings_tx.as_ref().map(|t| t.subscribe());
+    let current_settings = |tx: &Option<watch::Sender<EncoderSettings>>| {
+        tx.as_ref().map(|t| {
+            let s = t.borrow();
+            (s.fps, s.bitrate)
+        })
+    };
+    let mut last_sent = current_settings(&settings_tx);
 
     // Authenticate before anything else happens: no greeting, no events.
     if let Some(expected) = config.token.as_deref() {
@@ -1335,6 +1353,8 @@ async fn handle_connection(
         height: config.virtual_height,
         codec: config.codec.clone(),
         pen_only: *mode_rx.borrow_and_update(),
+        fps: last_sent.map(|(f, _)| f),
+        bitrate_kbps: last_sent.map(|(_, b)| b),
     };
 
     ws_sender
@@ -1355,12 +1375,53 @@ async fn handle_connection(
                     break;
                 }
                 let pen_only = *mode_rx.borrow();
+                let now = current_settings(&settings_tx);
                 let resp = InputResponse {
                     status: "mode".to_string(),
                     width: config.virtual_width,
                     height: config.virtual_height,
                     codec: config.codec.clone(),
                     pen_only,
+                    fps: now.map(|(f, _)| f),
+                    bitrate_kbps: now.map(|(_, b)| b),
+                };
+                last_sent = now;
+                if ws_sender
+                    .send(Message::Text(serde_json::to_string(&resp)?))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+            // The stream settings changed — from the GUI, the config file or
+            // this very tablet. Tell it the numbers only when fps or bitrate
+            // really differ from what it was last told: the settings also
+            // change for reasons the tablet does not care about.
+            changed = async {
+                match settings_rx.as_mut() {
+                    Some(rx) => rx.changed().await.is_ok(),
+                    None => std::future::pending::<bool>().await,
+                }
+            } => {
+                if !changed {
+                    settings_rx = None;
+                    continue;
+                }
+                let now = current_settings(&settings_tx);
+                if now == last_sent {
+                    continue;
+                }
+                last_sent = now;
+                let resp = InputResponse {
+                    status: "settings".to_string(),
+                    width: config.virtual_width,
+                    height: config.virtual_height,
+                    codec: config.codec.clone(),
+                    pen_only: *mode_rx.borrow(),
+                    fps: now.map(|(f, _)| f),
+                    bitrate_kbps: now.map(|(_, b)| b),
                 };
                 if ws_sender
                     .send(Message::Text(serde_json::to_string(&resp)?))
@@ -1690,6 +1751,26 @@ mod tests {
             "the tool must still be in proximity while the last sample goes out"
         );
         assert_eq!(f[4], vec![(EV_KEY, BTN_TOOL_PEN, 0)], "proximity out in its own frame");
+    }
+
+    #[test]
+    fn the_greeting_carries_the_computers_stream_settings_when_it_has_them() {
+        let with = InputResponse {
+            status: "connected".into(),
+            width: 2800,
+            height: 1752,
+            codec: "h264".into(),
+            pen_only: false,
+            fps: Some(90),
+            bitrate_kbps: Some(30000),
+        };
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(v["fps"], 90);
+        assert_eq!(v["bitrate_kbps"], 30000);
+        // An older tablet app, or a session without settings, sees no new keys.
+        let without = InputResponse { fps: None, bitrate_kbps: None, ..with };
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&without).unwrap()).unwrap();
+        assert!(v.get("fps").is_none() && v.get("bitrate_kbps").is_none());
     }
 
     #[test]
