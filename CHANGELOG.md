@@ -3,7 +3,7 @@
 Full notes for each version are on the
 [releases page](https://github.com/majmichu1/UScreen/releases).
 
-## Unreleased
+## 1.2.11 — 2026-10-24
 
 - The tablet app no longer overwrites `fps` and `bitrate` in `config.toml` every
   time it connects. Once you had pressed Apply in the app's ⚙, the app
